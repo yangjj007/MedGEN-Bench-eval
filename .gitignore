@@ -1,0 +1,24 @@
+# Publish only the maintained evaluation code from this legacy workspace.
+/*
+!/.gitignore
+!/README.md
+!/requirements-base.txt
+!/requirements-eval.txt
+!/agent.py
+!/inference.py
+!/eval.py
+!/prepare_medgen_tableiv.py
+!/test_tableiv_integration.py
+!/test_metrics_smoke.py
+!/api/
+!/util/
+
+# Local credentials, caches, generated data, and ad-hoc API fixtures.
+api/config.yaml
+api/__pycache__/
+api/get_edit_res copy.py
+api/test.jpg
+api/test*.py
+util/__pycache__/
+**/__pycache__/
+*.py[cod]

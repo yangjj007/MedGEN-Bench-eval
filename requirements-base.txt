@@ -1,0 +1,12 @@
+# Dataset preparation, inference clients, and no-API preflight commands.
+aiohttp>=3.10,<4
+huggingface-hub>=0.34,<2
+json5>=0.9,<1
+numpy>=1.26,<3
+openai>=1.40,<3
+oss2>=2.18,<3
+Pillow>=10,<13
+PyYAML>=6,<7
+requests>=2.31,<3
+tqdm>=4.66,<5
+

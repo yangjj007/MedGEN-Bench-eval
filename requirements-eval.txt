@@ -1,0 +1,11 @@
+-r requirements-base.txt
+
+# Full local metrics used by eval.py. Install CPU torch/torchvision first when
+# no CUDA runtime is needed (see README.md).
+bert-score>=0.3.13,<1
+lpips>=0.1.4,<1
+nltk>=3.8,<4
+scikit-image>=0.22,<1
+torch>=2.3,<3
+torchvision>=0.18,<1
+transformers>=4.30,<5
