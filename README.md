@@ -2,7 +2,7 @@
 
 本目录已接入论文 Table IV 版本数据：3 类格式、16 个任务、6,623 条样本。兼容层位于 `MedGEN_TableIV/`，原图通过相对软链接复用；400 条多图 VQA 已转换为带序号的 contact sheet，不会丢弃后续图片。
 
-- 代码：[Jack04810/MedGEN-Bench-eval](https://github.com/Jack04810/MedGEN-Bench-eval)
+- 代码：[yangjj007/MedGEN-Bench-eval](https://github.com/yangjj007/MedGEN-Bench-eval)
 - 完整数据：[Jack04810/MedGEN-Bench](https://huggingface.co/datasets/Jack04810/MedGEN-Bench)
 
 ## 数据
