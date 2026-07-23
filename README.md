@@ -140,4 +140,4 @@ python eval.py --data_path ./MedGEN_TableIV \
 - `basic_eval --local-metrics-only`：VQA、Image Editing、Multimodal Generation 各一条通过，结果为严格 JSON；type-wise 聚合通过。
 - 数据准备脚本从零复建：6,623 条、16 个任务、300 张 contact sheet、缺失 0；三份主 JSONL 与接入目录 SHA-256 完全一致。
 - Hugging Face：11,139 个本地文件逐路径核验，缺失 0、大小不一致 0；远端另有平台自动生成的 `.gitattributes`。
-- 临时全新环境复现：将在最终验收完成后记录。
+- 2026-07-23 临时全新环境复现：Python 3.12.9、PyTorch 2.13.0+cpu、Transformers 4.57.6；安装、`pip check`、数据重建、全部上述测试均通过，临时环境已删除。
