@@ -10,6 +10,8 @@
 !/prepare_medgen_tableiv.py
 !/test_tableiv_integration.py
 !/test_metrics_smoke.py
+!/test_clinical_text_metrics.py
+!/test_eval_clinical_integration.py
 !/api/
 !/util/
 

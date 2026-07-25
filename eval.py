@@ -15,6 +15,14 @@ import logging
 
 from util.prompt import vlm_holistic_judge_w_gt_prompt, vlm_holistic_judge_wo_gt_prompt
 from util.format_parser import extract_json
+from util.clinical_text_metrics import (
+    serialize_clinical_reference,
+    normalize_closed_form_answer,
+    compute_task_accuracy,
+    compute_text_em_f1,
+    compute_clinical_entity_metrics,
+    compute_radgraph_f1,
+)
 
 # Dataset/eval-input validation should not require model clients or heavyweight
 # metric packages.  Real evaluation still fails clearly if they are missing.
@@ -150,6 +158,92 @@ def generate_sample_id(item: dict) -> str:
         uid = hashlib.md5(combined.encode('utf-8')).hexdigest()
 
     return uid
+
+
+def canonical_answer_text(item: dict) -> str:
+    answer = item.get('answer', '')
+    if isinstance(answer, dict):
+        return serialize_clinical_reference(answer)
+    paper_task = str(item.get('paper_task') or item.get('sub-category') or '')
+    if paper_task in {'multiple-choice', 'blank-filling'}:
+        return normalize_closed_form_answer(answer, item.get('choice') or [])
+    return " ".join(str(answer or '').strip().split())
+
+
+def canonical_response_text(item: dict) -> str:
+    response = str(item.get('response', '') or '')
+    paper_task = str(item.get('paper_task') or item.get('sub-category') or '')
+    if paper_task in {'multiple-choice', 'blank-filling'}:
+        return normalize_closed_form_answer(response, item.get('choice') or [])
+    return " ".join(response.strip().split())
+
+
+def compute_text_metric_bundle(item: dict) -> dict:
+    response_text = canonical_response_text(item)
+    answer_text = canonical_answer_text(item)
+    paper_task = str(item.get('paper_task') or item.get('sub-category') or '')
+
+    metrics = {
+        'normalized_response_text': response_text,
+        'normalized_answer_text': answer_text,
+    }
+
+    task_accuracy = compute_task_accuracy(
+        paper_task=paper_task,
+        response=item.get('response', ''),
+        answer=item.get('answer', ''),
+        choices=item.get('choice') or [],
+    )
+    if task_accuracy is not None:
+        metrics['Task_Accuracy'] = task_accuracy
+
+    text_em, text_f1 = compute_text_em_f1(response_text, answer_text)
+    metrics['Text_EM'] = text_em
+    metrics['Text_F1'] = text_f1
+
+    clinical = compute_clinical_entity_metrics(response_text, answer_text)
+    metrics['Clinical_Entity_P'] = clinical['precision']
+    metrics['Clinical_Entity_R'] = clinical['recall']
+    metrics['Clinical_Entity_F1'] = clinical['f1']
+
+    radgraph = compute_radgraph_f1(response_text, answer_text)
+    metrics['radgraph_applicable'] = radgraph['applicable']
+    metrics['RadGraph_F1'] = radgraph['f1']
+    return metrics
+
+
+def append_metric_value(all_metrics: defaultdict, metric_name: str, value) -> None:
+    if isinstance(value, (int, float)) and np.isfinite(value):
+        all_metrics[metric_name].append(float(value))
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="评估多模态模型生成结果的脚本")
+    parser.add_argument('--data_path', type=str, default="./MedGEN", help='输入的jsonl文件路径')
+    parser.add_argument('--jsonl_path', type=str, required=True, help='输入的jsonl文件路径')
+    parser.add_argument('--batch_size', type=int, default=8, help='处理数据的批大小')
+    parser.add_argument('--mission', type=str, choices=['basic_eval', 'type_wise'], default='basic_eval', help='评估任务类型')
+    parser.add_argument('--type_key', type=str, default='modality', help='当 mission 为 type_wise 时，用于分类的键名')
+    parser.add_argument('--task', type=str, choices=['multimodal_generation', 'image_edit', 'vqa'], default='multimodal_generation', help='具体的评测任务类型 (multimodal_generation, image_edit, vqa)')
+    parser.add_argument('--max_samples', type=int, default=None, help='只读取前N条记录')
+    parser.add_argument('--validate-only', action='store_true', help='仅校验评测输入和图片路径，不加载指标模型或调用API')
+    parser.add_argument('--local-metrics-only', action='store_true', help='执行本地指标但跳过付费 VLM judge；仅支持 basic_eval')
+    parser.add_argument('--judge_model', type=str, default='', help='VLM judge 模型名')
+    parser.add_argument('--judge_backend', type=str, choices=['local_hf', 'api'], default='api', help='judge 后端类型')
+    parser.add_argument('--enable_clinical_text_metrics', action='store_true', default=True, help='开启 clinical text metrics')
+    return parser
+
+
+def build_vlm_judge_client(run_vlm_judge: bool, judge_model: str | None, judge_backend: str):
+    if not run_vlm_judge:
+        return None
+    selected_model = judge_model or "qwen3-vl-235b-a22b-instruct"
+    if judge_backend == 'local_hf':
+        logging.warning(
+            "judge_backend=local_hf 当前回退到现有 API judge 客户端；请确保网关可访问模型 %s",
+            selected_model,
+        )
+    return double_image_vlm(model_name=selected_model)
 
 
 # async def basic_eval(data: list, batch_size: int, task: str, data_path: str, jsonl_path: str) -> dict:
@@ -383,12 +477,17 @@ async def basic_eval(
     data_path: str,
     jsonl_path: str,
     run_vlm_judge: bool = True,
+    judge_model: str | None = None,
+    judge_backend: str = 'api',
+    enable_clinical_text_metrics: bool = True,
 ) -> dict:
     """
     对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
     """
-    vlm_client = double_image_vlm() if run_vlm_judge else None
+    vlm_client = build_vlm_judge_client(run_vlm_judge, judge_model, judge_backend)
     all_metrics = defaultdict(list)
+    text_metric_sample_count = 0
+    radgraph_applicable_count = 0
 
     # --- 1. 构建并加载中间结果 ---
     eval_results_dir = './eval_results'
@@ -425,9 +524,18 @@ async def basic_eval(
     logging.info(f"发现 {len(already_processed_items)} 条已完整处理的样本，将直接加载其所有结果。")
     for item in already_processed_items:
         # 加载图片和文本指标
-        for metric_key in ['LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score']:
+        for metric_key in [
+            'LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score',
+            'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+            'Task_Accuracy', 'Text_EM', 'Text_F1'
+        ]:
             if metric_key in item:
                 all_metrics[metric_key].append(item[metric_key])
+        if enable_clinical_text_metrics and 'normalized_answer_text' in item:
+            text_metric_sample_count += 1
+            if item.get('radgraph_applicable'):
+                radgraph_applicable_count += 1
+                append_metric_value(all_metrics, 'RadGraph_F1', item.get('RadGraph_F1'))
 
         # 加载VLM Judge指标
         judge_w_gt = item.get('vlm_judge_w_gt_result')
@@ -440,6 +548,11 @@ async def basic_eval(
             all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
             all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
             all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
+            append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_W_GT', judge_w_gt.get('anatomical_accuracy', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_W_GT', judge_w_gt.get('clinical_finding_accuracy', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Instruction_Compliance_W_GT', judge_w_gt.get('instruction_compliance', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_W_GT', judge_w_gt.get('cross_modal_consistency', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_W_GT', judge_w_gt.get('hallucination_omission_control', {}).get('score'))
             all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
 
         if judge_wo_gt:
@@ -449,6 +562,11 @@ async def basic_eval(
             all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
             all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
             all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
+            append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_WO_GT', judge_wo_gt.get('anatomical_accuracy', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_WO_GT', judge_wo_gt.get('clinical_finding_accuracy', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Instruction_Compliance_WO_GT', judge_wo_gt.get('instruction_compliance', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_WO_GT', judge_wo_gt.get('cross_modal_consistency', {}).get('score'))
+            append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_WO_GT', judge_wo_gt.get('hallucination_omission_control', {}).get('score'))
             all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
 
     # --- 动态调整 Prompt（保持原逻辑）---
@@ -494,17 +612,33 @@ async def basic_eval(
                 except (FileNotFoundError, IOError) as e:
                     logging.warning(f"无法加载图片，跳过图像指标计算: {e}")
             if task in ['multimodal_generation', 'vqa']:
-                eval_texts.append(item.get('response', ''))
-                ref_texts.append(item.get('answer', ''))
-            if not run_vlm_judge:
-                continue
+                if enable_clinical_text_metrics:
+                    bundle = compute_text_metric_bundle(item)
+                    for key, value in bundle.items():
+                        item[key] = value
+                    eval_texts.append(item.get('normalized_response_text', item.get('response', '')))
+                    ref_texts.append(item.get('normalized_answer_text', item.get('answer', '')))
+                    text_metric_sample_count += 1
+                    for metric_key in [
+                        'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+                        'Task_Accuracy', 'Text_EM', 'Text_F1'
+                    ]:
+                        append_metric_value(all_metrics, metric_key, item.get(metric_key))
+                    if item.get('radgraph_applicable'):
+                        radgraph_applicable_count += 1
+                        append_metric_value(all_metrics, 'RadGraph_F1', item.get('RadGraph_F1'))
+                else:
+                    eval_texts.append(item.get('response', ''))
+                    ref_texts.append(item.get('answer', ''))
+                if not run_vlm_judge:
+                    continue
             # ... (VLM请求准备逻辑保持不变)
             w_gt_prompt = "\n".join([
                 current_vlm_holistic_judge_w_gt_prompt[0], current_vlm_holistic_judge_w_gt_prompt[1],
                 current_vlm_holistic_judge_w_gt_prompt[2], current_vlm_holistic_judge_w_gt_prompt[3],
                 current_vlm_holistic_judge_w_gt_prompt[4], item.get('instruction', 'N/A'),
-                current_vlm_holistic_judge_w_gt_prompt[5], item.get('answer', 'N/A'),
-                current_vlm_holistic_judge_w_gt_prompt[6], item.get('response', 'N/A'),
+                current_vlm_holistic_judge_w_gt_prompt[5], item.get('normalized_answer_text', canonical_answer_text(item)),
+                current_vlm_holistic_judge_w_gt_prompt[6], item.get('normalized_response_text', canonical_response_text(item)),
                 current_vlm_holistic_judge_w_gt_prompt[7]
             ])
             if task == 'vqa' and item.get('input_image'):
@@ -538,7 +672,7 @@ async def basic_eval(
                 current_vlm_holistic_judge_wo_gt_prompt[2], current_vlm_holistic_judge_wo_gt_prompt[3],
                 current_vlm_holistic_judge_wo_gt_prompt[4], item.get('instruction', 'N/A'),
                 current_vlm_holistic_judge_wo_gt_prompt[5],
-                current_vlm_holistic_judge_wo_gt_prompt[6], item.get('response', 'N/A'),
+                current_vlm_holistic_judge_wo_gt_prompt[6], item.get('normalized_response_text', canonical_response_text(item)),
                 current_vlm_holistic_judge_wo_gt_prompt[7]
             ])
             if item.get('input_image'):
@@ -745,6 +879,11 @@ async def basic_eval(
                 all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
                 all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
                 all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
+                append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_W_GT', judge_w_gt.get('anatomical_accuracy', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_W_GT', judge_w_gt.get('clinical_finding_accuracy', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Instruction_Compliance_W_GT', judge_w_gt.get('instruction_compliance', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_W_GT', judge_w_gt.get('cross_modal_consistency', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_W_GT', judge_w_gt.get('hallucination_omission_control', {}).get('score'))
                 all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
             if judge_wo_gt:
                 if task == 'multimodal_generation':
@@ -753,6 +892,11 @@ async def basic_eval(
                 all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
                 all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
                 all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
+                append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_WO_GT', judge_wo_gt.get('anatomical_accuracy', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_WO_GT', judge_wo_gt.get('clinical_finding_accuracy', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Instruction_Compliance_WO_GT', judge_wo_gt.get('instruction_compliance', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_WO_GT', judge_wo_gt.get('cross_modal_consistency', {}).get('score'))
+                append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_WO_GT', judge_wo_gt.get('hallucination_omission_control', {}).get('score'))
                 all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
 
             # 更新用于保存的字典（现在item包含了所有指标）
@@ -778,6 +922,8 @@ async def basic_eval(
 
     accuracy_rates = calculate_accuracy_rates(all_metrics)
     final_results.update(accuracy_rates)
+    if text_metric_sample_count:
+        final_results['RadGraph_Coverage'] = radgraph_applicable_count / text_metric_sample_count
 
     logging.info(f"评估完成。包含所有指标的中间结果已保存至: {intermediate_file}")
     return final_results
@@ -1358,7 +1504,11 @@ def save_results_for_type_wise(results: dict, jsonl_path: str, task: str):
 def metrics_from_record(item: dict, task: str) -> dict:
     """Extract already-computed local and VLM metrics from one result record."""
     metrics = {}
-    for key in ['LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score']:
+    for key in [
+        'LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score',
+        'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+        'RadGraph_F1', 'Task_Accuracy', 'Text_EM', 'Text_F1'
+    ]:
         value = item.get(key)
         if isinstance(value, (int, float)) and np.isfinite(value):
             metrics[key] = float(value)
@@ -1375,6 +1525,11 @@ def metrics_from_record(item: dict, task: str) -> dict:
             'content_accuracy': f'VLM_Content_Accuracy_{suffix}',
             'relevance_and_responsiveness': f'VLM_Relevance_{suffix}',
             'consistency': f'VLM_Consistency_{suffix}',
+            'anatomical_accuracy': f'VLM_Anatomical_Accuracy_{suffix}',
+            'clinical_finding_accuracy': f'VLM_Clinical_Finding_Accuracy_{suffix}',
+            'instruction_compliance': f'VLM_Instruction_Compliance_{suffix}',
+            'cross_modal_consistency': f'VLM_Cross_Modal_Consistency_{suffix}',
+            'hallucination_omission_control': f'VLM_Hallucination_Omission_Control_{suffix}',
         }
         if task == 'multimodal_generation':
             score_fields.update({
@@ -1411,14 +1566,22 @@ async def aggregate_type_wise_results(
     all_results = {}
     for group_name, records in sorted(grouped_data.items()):
         group_metrics = defaultdict(list)
+        radgraph_total = 0
+        radgraph_applicable = 0
         for item in records:
             for metric_name, value in metrics_from_record(item, task).items():
                 group_metrics[metric_name].append(value)
+            if 'normalized_answer_text' in item:
+                radgraph_total += 1
+                if item.get('radgraph_applicable'):
+                    radgraph_applicable += 1
 
         summary = {'Sample_Count': len(records)}
         for metric_name, values in sorted(group_metrics.items()):
             summary[f'Average_{metric_name}'] = float(np.mean(values))
             summary[f'Std_{metric_name}'] = float(np.std(values))
+        if radgraph_total:
+            summary['RadGraph_Coverage'] = radgraph_applicable / radgraph_total
         summary.update(calculate_accuracy_rates(group_metrics))
         all_results[group_name] = summary
 
@@ -1433,19 +1596,7 @@ async def aggregate_type_wise_results(
 
 
 async def main():
-    parser = argparse.ArgumentParser(description="评估多模态模型生成结果的脚本")
-    parser.add_argument('--data_path', type=str, default="./MedGEN", help='输入的jsonl文件路径')
-    parser.add_argument('--jsonl_path', type=str, required=True, help='输入的jsonl文件路径')
-    parser.add_argument('--batch_size', type=int, default=8, help='处理数据的批大小')
-    parser.add_argument('--mission', type=str, choices=['basic_eval', 'type_wise'], default='basic_eval', help='评估任务类型')
-    parser.add_argument('--type_key', type=str, default='modality', help='当 mission 为 type_wise 时，用于分类的键名')
-    # --- 新增代码 ---
-    parser.add_argument('--task', type=str, choices=['multimodal_generation', 'image_edit', 'vqa'], default='multimodal_generation', help='具体的评测任务类型 (multimodal_generation, image_edit, vqa)')
-    parser.add_argument('--max_samples', type=int, default=None, help='只读取前N条记录')
-    parser.add_argument('--validate-only', action='store_true', help='仅校验评测输入和图片路径，不加载指标模型或调用API')
-    parser.add_argument('--local-metrics-only', action='store_true', help='执行本地指标但跳过付费 VLM judge；仅支持 basic_eval')
-    # --- 新增代码结束 ---
-    
+    parser = build_arg_parser()
     args = parser.parse_args()
 
     # 加载数据
@@ -1480,6 +1631,9 @@ async def main():
             args.data_path,
             args.jsonl_path,
             run_vlm_judge=not args.local_metrics_only,
+            judge_model=args.judge_model,
+            judge_backend=args.judge_backend,
+            enable_clinical_text_metrics=args.enable_clinical_text_metrics,
         )
     elif args.mission == 'type_wise':
         results = await aggregate_type_wise_results(

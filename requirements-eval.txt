@@ -5,6 +5,7 @@
 bert-score>=0.3.13,<1
 lpips>=0.1.4,<1
 nltk>=3.8,<4
+radgraph>=0.1.18,<0.2
 scikit-image>=0.22,<1
 torch>=2.3,<3
 torchvision>=0.18,<1

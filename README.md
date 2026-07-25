@@ -40,6 +40,8 @@ pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
 pip install -r requirements-eval.txt
 ```
 
+`requirements-eval.txt` 现已包含官方 `radgraph` 包。首次计算 `RadGraph_F1` 时会按包默认行为下载 RadGraph 模型缓存；可用 `MEDGEN_RADGRAPH_MODEL_TYPE` 覆盖默认 `radgraph-xl`，也可用 `MEDGEN_RADGRAPH_CACHE_DIR` 指定模型缓存目录。
+
 真实 API 推理前创建本地配置；不要提交密钥：
 
 ```bash
@@ -129,6 +131,8 @@ python eval.py --data_path ./MedGEN_TableIV \
 ```
 
 默认基础评测同时运行本地指标和 VLM judge。只检查本地指标、不调用付费 API 时添加 `--local-metrics-only`；该选项仅支持 `basic_eval`。基础结果写入 `eval_results/`。对其中的 `*_with_vlm.jsonl` 或 `*_local_metrics.jsonl` 使用 `--mission type_wise --type_key modality` 可按模态聚合，结果写入 `eval_results_type_wise/`。图像全参考指标使用 `ground_truth_image`，VQA 文本指标使用 `answer`。CPU 线程数默认 4，可通过 `MEDGEN_TORCH_NUM_THREADS` 调整。
+
+对文本样本，评测会优先尝试官方 `radgraph.F1RadGraph` 计算 `RadGraph_F1`，并取文献里常用的 `RG_ER` 分量；若本地缺少依赖或第三方运行失败，则自动回退到仓内的轻量 heuristic 版本，避免整条评测流水线中断。
 
 ## 已验证
 

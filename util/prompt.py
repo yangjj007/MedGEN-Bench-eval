@@ -63,39 +63,39 @@ All input images contain artificially rendered black text at the bottom center t
 - Ground truth images are labeled with "Ground Truth"
 - Generated images are labeled with "Generated Answer"
 
-Judge Requirement: Evaluate the model-generated content based on the following dimensions:
-1. Content Accuracy: The factual correctness of both textual information and visual elements, particularly important in medical contexts.
-2. Relevance and Responsiveness: How well the generated content addresses the given query and meets the specific requirements.
-3. Consistency: Whether the image type or text format align with the given instructions and maintain coherent style.
+Judge Requirement: Evaluate the model-generated content based on the following medical dimensions:
+1. Anatomical Accuracy: Whether anatomical structures, locations, and spatial relationships are correct.
+2. Clinical Finding Accuracy: Whether findings, pathology, severity, and devices are medically correct.
+3. Instruction Compliance: Whether the generated content follows the instruction and requested transformation exactly.
 """,
 """
-4. Visual-Textual Alignment: The degree to which generated images match and support the accompanying text information.
-5. Coherence: How well the text and images work together to convey a unified message, ensuring consistency between textual and visual information.
+4. Cross-Modal Consistency: Whether the text and image content support the same medical conclusion.
+5. Hallucination/Omission Control: Whether clinically important findings are invented or omitted.
 """,
 """
 
 Output Requirement: Please output in JSON format, including scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score. The JSON should follow this structure:
 
 {{
-  "content_accuracy": {{
+  "anatomical_accuracy": {{
     "score": 0,
     "explanation": ""
   }},
-  "relevance_and_responsiveness": {{
+  "clinical_finding_accuracy": {{
     "score": 0,
     "explanation": ""
   }},
-  "consistency": {{
+  "instruction_compliance": {{
     "score": 0,
     "explanation": ""
   }},
 """,
 """
-  "coherence": {{
+  "cross_modal_consistency": {{
     "score": 0,
     "explanation": ""
   }},
-  "visual_textual_alignment": {{
+  "hallucination_omission_control": {{
     "score": 0,
     "explanation": ""
   }},
@@ -125,39 +125,39 @@ All images contain artificially rendered black text at the bottom center to indi
 - Input images are labeled with "Input"
 - Output images that model generate are labeled with "Output"
 
-Judge Requirement: Evaluate the model-generated content based on the following dimensions:
-1. Content Accuracy: The factual correctness of both textual information and visual elements, particularly important in medical contexts.
-2. Relevance and Responsiveness: How well the generated content addresses the given query and meets the specific requirements.
-3. Consistency: Whether the image type or text format align with the given instructions and maintain coherent style.
+Judge Requirement: Evaluate the model-generated content based on the following medical dimensions:
+1. Anatomical Accuracy: Whether anatomical structures, locations, and spatial relationships are correct.
+2. Clinical Finding Accuracy: Whether findings, pathology, severity, and devices are medically correct.
+3. Instruction Compliance: Whether the generated content follows the instruction and requested transformation exactly.
 """,
 """
-4. Visual-Textual Alignment: The degree to which generated images match and support the accompanying text information.
-5. Coherence: How well the text and images work together to convey a unified message, ensuring consistency between textual and visual information.
+4. Cross-Modal Consistency: Whether the text and image content support the same medical conclusion.
+5. Hallucination/Omission Control: Whether clinically important findings are invented or omitted.
 """,
 """
 
 Output Requirement: Please output in JSON format, including scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score. The JSON should follow this structure:
 
 {{
-  "content_accuracy": {{
+  "anatomical_accuracy": {{
     "score": 0,
     "explanation": ""
   }},
-  "relevance_and_responsiveness": {{
+  "clinical_finding_accuracy": {{
     "score": 0,
     "explanation": ""
   }},
-  "consistency": {{
+  "instruction_compliance": {{
     "score": 0,
     "explanation": ""
   }},
 """,
 """
-  "coherence": {{
+  "cross_modal_consistency": {{
     "score": 0,
     "explanation": ""
   }},
-  "visual_textual_alignment": {{
+  "hallucination_omission_control": {{
     "score": 0,
     "explanation": ""
   }},
