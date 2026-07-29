@@ -4,6 +4,7 @@
 
 - 代码：[yangjj007/MedGEN-Bench-eval](https://github.com/yangjj007/MedGEN-Bench-eval)
 - 完整数据：[Jack04810/MedGEN-Bench](https://huggingface.co/datasets/Jack04810/MedGEN-Bench)
+- 已发布推理结果：[Jack04810/MedGEN_data](https://huggingface.co/datasets/Jack04810/MedGEN_data)
 
 ## 数据
 
@@ -21,6 +22,15 @@ python prepare_medgen_tableiv.py
 ```
 
 `prepare_medgen_tableiv.py` 会校验任务计数和所有图片路径，并生成三份 JSONL、smoke 文件及 VQA contact sheet。若输出目录已存在，先将其移走或指定新的 `--output`，脚本不会覆盖已有数据。
+
+下载已发布的模型推理结果：
+
+```bash
+hf download Jack04810/MedGEN_data --repo-type dataset \
+  --local-dir ../medical-bench/MedGEN_data
+```
+
+若该 Hugging Face 仓库需要身份验证，请先执行 `hf auth login`，或通过 `HF_TOKEN` 提供具有读取权限的访问令牌。
 
 ## 环境
 
