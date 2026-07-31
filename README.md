@@ -30,6 +30,14 @@ hf download Jack04810/MedGEN_data --repo-type dataset \
   --local-dir ../medical-bench/MedGEN_data
 ```
 
+注意：`MedGEN_data` 的原始 baseline bundle 曾发生不完整上传。2026-07-31
+已补回可从原始 ZIP 校验恢复的 283 张输入/GT 图，并发布
+`Baseline_Inference_Results_Organized/eval_available/` 可用视图。该视图包含
+19 份非空 JSONL、14,690 条路径完整的记录；仍缺失的 18,129 张模型输出和
+2 份 JSONL 必须由原组织机重新上传。运行旧 baseline 前请查看数据集目录中的
+`README.md` 和 `eval_available/missing_files.sha256`，不要把可用子集误当成
+完整的 25-baseline 结果包。
+
 若该 Hugging Face 仓库需要身份验证，请先执行 `hf auth login`，或通过 `HF_TOKEN` 提供具有读取权限的访问令牌。
 
 ## 环境
