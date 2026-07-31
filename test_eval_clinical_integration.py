@@ -117,6 +117,55 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
 
 
 class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
+    async def test_image_edit_local_metrics_does_not_build_vlm_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = os.path.join(temp_dir, "output.png")
+            reference_path = os.path.join(temp_dir, "reference.png")
+            Image.new("RGB", (8, 8), color="white").save(output_path)
+            Image.new("RGB", (8, 8), color="white").save(reference_path)
+            jsonl_path = os.path.join(temp_dir, "image_edit_local.jsonl")
+            intermediate_path = os.path.join(
+                "eval_results", "image_edit_local_local_metrics.jsonl"
+            )
+            if os.path.exists(intermediate_path):
+                os.remove(intermediate_path)
+
+            data = [
+                {
+                    "category": "ImageEdit",
+                    "sub-category": "contrast-enhancement",
+                    "modality": "Radiograph",
+                    "input_image": reference_path,
+                    "ground_truth_image": reference_path,
+                    "output_image": output_path,
+                    "instruction": "Enhance the contrast.",
+                    "sample_id": "unit:test:image-edit-local:1",
+                }
+            ]
+
+            async def fake_image_metric(eval_images, ref_images, eval_metric):
+                return [1.0 for _ in eval_images]
+
+            original_image_metric = eval_module.batch_async_FR_IQA
+            try:
+                eval_module.batch_async_FR_IQA = fake_image_metric
+                results = await eval_module.basic_eval(
+                    data=data,
+                    batch_size=1,
+                    task="image_edit",
+                    data_path=temp_dir,
+                    jsonl_path=jsonl_path,
+                    run_vlm_judge=False,
+                )
+            finally:
+                eval_module.batch_async_FR_IQA = original_image_metric
+
+            self.assertEqual(results["Average_LPIPS"], 1.0)
+            with open(intermediate_path, "r", encoding="utf-8") as handle:
+                rows = [json.loads(line) for line in handle if line.strip()]
+            self.assertEqual(len(rows), 1)
+            self.assertTrue(rows[0]["_local_metrics_complete"])
+
     async def test_basic_eval_writes_new_clinical_metrics(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             image_path = os.path.join(temp_dir, "input.png")

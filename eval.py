@@ -630,8 +630,8 @@ async def basic_eval(
                 else:
                     eval_texts.append(item.get('response', ''))
                     ref_texts.append(item.get('answer', ''))
-                if not run_vlm_judge:
-                    continue
+            if not run_vlm_judge:
+                continue
             # ... (VLM请求准备逻辑保持不变)
             w_gt_prompt = "\n".join([
                 current_vlm_holistic_judge_w_gt_prompt[0], current_vlm_holistic_judge_w_gt_prompt[1],
