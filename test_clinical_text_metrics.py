@@ -11,6 +11,8 @@ from unittest.mock import patch
 import util.clinical_text_metrics as clinical_text_metrics
 from util.clinical_text_metrics import (
     compute_clinical_entity_metrics,
+    compute_entity_error_metrics,
+    compute_factual_precision_chexbert,
     compute_radgraph_f1,
     compute_task_accuracy,
     compute_text_em_f1,
@@ -104,10 +106,14 @@ class ClinicalTextMetricTest(unittest.TestCase):
         self.assertGreaterEqual(metrics["recall"], 0.75)
         self.assertGreaterEqual(metrics["f1"], 0.75)
 
-    def test_compute_radgraph_f1_marks_non_report_short_answer_not_applicable(self) -> None:
-        result = compute_radgraph_f1("A. H&E", "A. H&E")
-        self.assertFalse(result["applicable"])
-        self.assertIsNone(result["f1"])
+    def test_compute_radgraph_f1_fails_when_scorer_unavailable(self) -> None:
+        with patch.object(
+            clinical_text_metrics,
+            "_get_radgraph_f1_scorer",
+            side_effect=RuntimeError("RadGraph unavailable"),
+        ):
+            with self.assertRaises(RuntimeError):
+                compute_radgraph_f1("A. H&E", "A. H&E")
 
     def test_compute_radgraph_f1_prefers_external_package_rg_er_score(self) -> None:
         class FakeF1RadGraph:
@@ -163,6 +169,41 @@ class ClinicalTextMetricTest(unittest.TestCase):
         self.assertFalse(result["applicable"])
         self.assertIsNone(result["f1"])
         self.assertEqual(result["backend"], "radgraph")
+
+
+    def test_entity_error_metrics_detect_hallucination_and_omission(self) -> None:
+        # 响应中多出 nodule（幻觉），遗漏了 pleural effusion（遗漏）
+        result = compute_entity_error_metrics(
+            "Chest radiograph shows a pulmonary nodule in the right upper lobe.",
+            "Chest radiograph shows a right pleural effusion.",
+        )
+        self.assertGreater(result["hallucination_rate"], 0.0)
+        self.assertGreater(result["omission_rate"], 0.0)
+        self.assertIn("nodule", result["hallucinated_entities"])
+        self.assertIn("pleural effusion", result["omitted_entities"])
+        self.assertLess(result["factual_precision"], 1.0)
+
+    def test_entity_error_metrics_perfect_match_is_zero_error(self) -> None:
+        result = compute_entity_error_metrics(
+            "No pneumothorax. Lungs are clear.",
+            "No pneumothorax. Lungs are clear.",
+        )
+        self.assertEqual(result["hallucination_rate"], 0.0)
+        self.assertEqual(result["omission_rate"], 0.0)
+        self.assertEqual(result["factual_precision"], 1.0)
+
+    def test_entity_error_metrics_empty_both_sides(self) -> None:
+        result = compute_entity_error_metrics("normal", "normal")
+        self.assertEqual(result["hallucination_rate"], 0.0)
+        self.assertEqual(result["omission_rate"], 0.0)
+        self.assertEqual(result["factual_precision"], 1.0)
+
+    def test_chexbert_hook_disabled_by_default(self) -> None:
+        self.assertIsNone(compute_factual_precision_chexbert("text", "text"))
+
+    def test_chexbert_hook_enabled_but_module_missing_returns_none(self) -> None:
+        with patch.dict("os.environ", {"MEDGEN_ENABLE_CHEXBERT": "1"}, clear=False):
+            self.assertIsNone(compute_factual_precision_chexbert("text", "text"))
 
 
 if __name__ == "__main__":

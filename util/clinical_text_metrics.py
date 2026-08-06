@@ -239,6 +239,72 @@ def compute_clinical_entity_metrics(response: Any, reference: Any) -> dict[str, 
     }
 
 
+def compute_entity_error_metrics(response: Any, reference: Any) -> dict[str, Any]:
+    """实体级错误分类：幻觉（响应实体不在参考中）、遗漏（参考实体缺失）、事实精确率。
+
+    - hallucination_rate: |响应实体 \\ 参考实体| / |响应实体|（0 表示没有虚构实体）。
+    - omission_rate:      |参考实体 \\ 响应实体| / |参考实体|（0 表示没有遗漏）。
+    - factual_precision:  |响应 ∩ 参考| / |响应|（与实体 precision 一致，供报告生成任务使用）。
+    """
+    response_entities = extract_clinical_entities(response)
+    reference_entities = extract_clinical_entities(reference)
+    if not response_entities and not reference_entities:
+        return {
+            "hallucination_rate": 0.0,
+            "omission_rate": 0.0,
+            "factual_precision": 1.0,
+            "hallucinated_entities": [],
+            "omitted_entities": [],
+        }
+    hallucinated = response_entities - reference_entities
+    omitted = reference_entities - response_entities
+    return {
+        "hallucination_rate": (
+            len(hallucinated) / len(response_entities) if response_entities else 0.0
+        ),
+        "omission_rate": (
+            len(omitted) / len(reference_entities) if reference_entities else 0.0
+        ),
+        "factual_precision": (
+            len(response_entities & reference_entities) / len(response_entities)
+            if response_entities
+            else 0.0
+        ),
+        "hallucinated_entities": sorted(hallucinated),
+        "omitted_entities": sorted(omitted),
+    }
+
+
+def compute_factual_precision_chexbert(response: Any, reference: Any) -> float | None:
+    """可选 CheXbert 风格事实校验（默认关闭）。
+
+    仅当环境变量 MEDGEN_ENABLE_CHEXBERT=1 且可导入配置的模块时才启用。
+    模块需暴露 ``factual_precision(response, reference) -> float``；缺失或调用
+    失败时返回 None，调用方跳过该指标（避免把可选能力变成硬依赖）。
+    """
+    if os.environ.get("MEDGEN_ENABLE_CHEXBERT", "").strip() != "1":
+        return None
+    module_name = os.environ.get("MEDGEN_CHEXBERT_MODULE", "chexbert").strip()
+    try:
+        chexbert_module = importlib.import_module(module_name)
+    except ImportError:
+        LOGGER.warning(
+            "MEDGEN_ENABLE_CHEXBERT=1 但无法导入模块 %r，跳过 CheXbert 事实校验。",
+            module_name,
+        )
+        return None
+    scorer = getattr(chexbert_module, "factual_precision", None)
+    if scorer is None:
+        LOGGER.warning("模块 %r 未暴露 factual_precision，跳过 CheXbert 事实校验。", module_name)
+        return None
+    try:
+        score = scorer(_collapse_spaces(str(response or "")), serialize_clinical_reference(reference))
+        return float(score)
+    except Exception as exc:  # pragma: no cover - defensive third-party fallback
+        LOGGER.warning("CheXbert 事实校验调用失败，跳过：%s", exc)
+        return None
+
+
 def _radgraph_model_type() -> str:
     return os.environ.get("MEDGEN_RADGRAPH_MODEL_TYPE", "radgraph-xl")
 
@@ -263,12 +329,12 @@ def _radgraph_cuda_device() -> int | None:
 def _get_radgraph_f1_scorer():
     try:
         radgraph_module = importlib.import_module("radgraph")
-    except ImportError:
-        return None
+    except ImportError as exc:
+        raise RuntimeError("RadGraph is required; install requirements-eval.txt") from exc
 
     scorer_cls = getattr(radgraph_module, "F1RadGraph", None)
     if scorer_cls is None:
-        raise AttributeError("radgraph package does not expose F1RadGraph")
+        raise RuntimeError("Installed radgraph package does not expose F1RadGraph")
 
     scorer_kwargs: dict[str, Any] = {
         "reward_level": "all",
@@ -303,21 +369,16 @@ def _extract_rg_er_score(mean_reward: Any, reward_list: Any) -> float:
 def _compute_radgraph_f1_with_package(response_text: str, reference_text: str) -> dict[str, Any] | None:
     try:
         scorer = _get_radgraph_f1_scorer()
-    except Exception as exc:  # pragma: no cover - defensive fallback around third-party runtime
-        LOGGER.warning("Falling back to heuristic RadGraph_F1 because the radgraph scorer failed to initialize: %s", exc)
-        return None
-
-    if scorer is None:
-        return None
+    except Exception as exc:  # pragma: no cover - third-party initialization
+        raise RuntimeError("RadGraph scorer failed to initialize") from exc
 
     try:
         mean_reward, reward_list, hypothesis_annotation_lists, reference_annotation_lists = scorer(
             hyps=[response_text],
             refs=[reference_text],
         )
-    except Exception as exc:  # pragma: no cover - defensive fallback around third-party runtime
-        LOGGER.warning("Falling back to heuristic RadGraph_F1 because the radgraph scorer failed during inference: %s", exc)
-        return None
+    except Exception as exc:  # pragma: no cover - third-party inference
+        raise RuntimeError("RadGraph scorer failed during inference") from exc
 
     hypothesis_annotation = hypothesis_annotation_lists[0] if hypothesis_annotation_lists else {}
     reference_annotation = reference_annotation_lists[0] if reference_annotation_lists else {}
@@ -332,20 +393,13 @@ def _compute_radgraph_f1_with_package(response_text: str, reference_text: str) -
 
 
 def compute_radgraph_f1(response: Any, reference: Any) -> dict[str, Any]:
+    # Initialize the real scorer before checking applicability.  Even a short
+    # answer must not make a run appear successful when RadGraph is absent.
+    _get_radgraph_f1_scorer()
     reference_text = serialize_clinical_reference(reference)
     response_text = _collapse_spaces(str(response or ""))
 
     if len(_tokenize(reference_text)) < 4 or len(_tokenize(response_text)) < 4:
         return {"applicable": False, "f1": None, "backend": "skipped"}
 
-    package_result = _compute_radgraph_f1_with_package(response_text, reference_text)
-    if package_result is not None:
-        return package_result
-
-    response_entities = extract_clinical_entities(response_text)
-    reference_entities = extract_clinical_entities(reference_text)
-    if not response_entities and not reference_entities:
-        return {"applicable": False, "f1": None, "backend": "heuristic"}
-
-    metrics = compute_clinical_entity_metrics(response_text, reference_text)
-    return {"applicable": True, "f1": metrics["f1"], "backend": "heuristic"}
+    return _compute_radgraph_f1_with_package(response_text, reference_text)

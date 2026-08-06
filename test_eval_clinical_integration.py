@@ -13,6 +13,7 @@ import eval as eval_module
 from PIL import Image
 
 from util.prompt import (
+    build_vlm_judge_prompt,
     vlm_holistic_judge_w_gt_prompt,
     vlm_holistic_judge_wo_gt_prompt,
 )
@@ -25,16 +26,87 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
             [
                 "--jsonl_path",
                 "dummy.jsonl",
+                "--mission",
+                "stats",
                 "--judge_model",
                 "instruct-biomedgpt-base",
+                "--judge_config",
+                "./api/config.vllm.yaml",
                 "--judge_backend",
                 "api",
                 "--enable_clinical_text_metrics",
             ]
         )
         self.assertEqual(args.judge_model, "instruct-biomedgpt-base")
+        self.assertEqual(args.judge_config, "./api/config.vllm.yaml")
         self.assertEqual(args.judge_backend, "api")
         self.assertTrue(args.enable_clinical_text_metrics)
+
+    def test_build_vlm_judge_client_passes_judge_config(self) -> None:
+        calls = []
+
+        class FakeClient:
+            def __init__(self, config_path, model_name):
+                calls.append({"config_path": config_path, "model_name": model_name})
+
+        original = eval_module.double_image_vlm
+        try:
+            eval_module.double_image_vlm = FakeClient
+            eval_module.build_vlm_judge_client(
+                run_vlm_judge=True,
+                judge_model="MedVision-V0-7B",
+                judge_backend="api",
+                judge_config="./api/config.vllm.yaml",
+            )
+            eval_module.build_vlm_judge_client(
+                run_vlm_judge=True,
+                judge_model="",
+                judge_backend="api",
+                judge_config="./api/config.vllm.yaml",
+            )
+            self.assertIsNone(
+                eval_module.build_vlm_judge_client(
+                    run_vlm_judge=False,
+                    judge_model="MedVision-V0-7B",
+                    judge_backend="api",
+                    judge_config="./api/config.vllm.yaml",
+                )
+            )
+        finally:
+            eval_module.double_image_vlm = original
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0]["config_path"], "./api/config.vllm.yaml")
+        self.assertEqual(calls[0]["model_name"], "MedVision-V0-7B")
+        # judge_model 为空时传空串，由 double_image_vlm 回退到配置文件 model_name
+        self.assertEqual(calls[1]["config_path"], "./api/config.vllm.yaml")
+        self.assertEqual(calls[1]["model_name"], "")
+
+    def test_metric_thresholds_fixed_for_ssim_and_extended(self) -> None:
+        self.assertIn("Anatomical_Embedding_Similarity", eval_module.METRIC_THRESHOLDS)
+        for metric_name in [
+            "Anatomical_Embedding_Similarity",
+            "Entity_Hallucination_Rate",
+            "Entity_Omission_Rate",
+            "Entity_Factual_Precision",
+        ]:
+            self.assertIn(metric_name, eval_module.METRIC_THRESHOLDS)
+
+    def test_task_specific_judge_prompt_builder(self) -> None:
+        prompt = build_vlm_judge_prompt("vqa", with_gt=True)
+        combined = "\n".join(prompt).lower()
+        self.assertIn("task-specific checklist", combined)
+        self.assertIn("answer fidelity", combined)
+        for phrase in [
+            "anatomical accuracy",
+            "clinical finding accuracy",
+            "instruction compliance",
+            "cross-modal consistency",
+            "hallucination/omission control",
+        ]:
+            self.assertIn(phrase, combined)
+        edit_prompt = "\n".join(build_vlm_judge_prompt("image_edit", with_gt=False)).lower()
+        self.assertIn("transformation applied", edit_prompt)
 
     def test_metrics_from_record_extracts_new_clinical_and_judge_fields(self) -> None:
         metrics = eval_module.metrics_from_record(
@@ -73,6 +145,19 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
         self.assertEqual(metrics["VLM_Hallucination_Omission_Control_W_GT"], 6.0)
         self.assertEqual(metrics["VLM_Overall_Score_W_GT"], 8.0)
 
+    def test_metrics_from_record_extracts_new_image_metrics(self) -> None:
+        metrics = eval_module.metrics_from_record(
+            {
+                "Anatomical_Embedding_Similarity": 0.85,
+                "Entity_Hallucination_Rate": 0.2,
+                "Entity_Omission_Rate": 0.1,
+                "Entity_Factual_Precision": 0.8,
+            },
+            "vqa",
+        )
+        self.assertEqual(metrics["Anatomical_Embedding_Similarity"], 0.85)
+        self.assertEqual(metrics["Entity_Hallucination_Rate"], 0.2)
+
     def test_aggregate_type_wise_results_reports_radgraph_coverage(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = os.path.join(temp_dir, "typewise.jsonl")
@@ -81,6 +166,7 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
                     data=[
                         {
                             "modality": "Radiograph",
+                            "paper_task": "question-answering",
                             "Clinical_Entity_F1": 1.0,
                             "RadGraph_F1": 0.8,
                             "radgraph_applicable": True,
@@ -88,6 +174,7 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
                         },
                         {
                             "modality": "Radiograph",
+                            "paper_task": "question-answering",
                             "Clinical_Entity_F1": 0.0,
                             "radgraph_applicable": False,
                             "normalized_answer_text": "A. H&E",
@@ -117,7 +204,7 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
 
 
 class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
-    async def test_image_edit_local_metrics_does_not_build_vlm_requests(self) -> None:
+    async def test_image_edit_clinical_metrics_does_not_build_vlm_requests(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             output_path = os.path.join(temp_dir, "output.png")
             reference_path = os.path.join(temp_dir, "reference.png")
@@ -143,12 +230,17 @@ class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
                 }
             ]
 
-            async def fake_image_metric(eval_images, ref_images, eval_metric):
+            async def fake_anatomical_metric(eval_images, ref_images):
+                return [{"Anatomical_Embedding_Similarity": 1.0} for _ in eval_images]
+
+            async def fake_full_image_metric(eval_images, ref_images, metric_name):
                 return [1.0 for _ in eval_images]
 
-            original_image_metric = eval_module.batch_async_FR_IQA
+            original_image_metric = eval_module.batch_async_anatomical_metrics
+            original_full_image_metric = eval_module.batch_async_FR_IQA
             try:
-                eval_module.batch_async_FR_IQA = fake_image_metric
+                eval_module.batch_async_anatomical_metrics = fake_anatomical_metric
+                eval_module.batch_async_FR_IQA = fake_full_image_metric
                 results = await eval_module.basic_eval(
                     data=data,
                     batch_size=1,
@@ -158,9 +250,10 @@ class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
                     run_vlm_judge=False,
                 )
             finally:
-                eval_module.batch_async_FR_IQA = original_image_metric
+                eval_module.batch_async_anatomical_metrics = original_image_metric
+                eval_module.batch_async_FR_IQA = original_full_image_metric
 
-            self.assertEqual(results["Average_LPIPS"], 1.0)
+            self.assertEqual(results["Average_Anatomical_Embedding_Similarity"], 1.0)
             with open(intermediate_path, "r", encoding="utf-8") as handle:
                 rows = [json.loads(line) for line in handle if line.strip()]
             self.assertEqual(len(rows), 1)
@@ -214,8 +307,12 @@ class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
                 return [1.0 for _ in eval_texts]
 
             original_text_metric = eval_module.batch_async_evaluate_text_quality
+            original_radgraph = eval_module.compute_radgraph_f1
             try:
                 eval_module.batch_async_evaluate_text_quality = fake_text_metric
+                eval_module.compute_radgraph_f1 = lambda response, reference: {
+                    "applicable": True, "f1": 0.9, "backend": "radgraph"
+                }
                 results = await eval_module.basic_eval(
                     data=data,
                     batch_size=1,
@@ -226,6 +323,7 @@ class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 eval_module.batch_async_evaluate_text_quality = original_text_metric
+                eval_module.compute_radgraph_f1 = original_radgraph
 
             self.assertIn("Average_Clinical_Entity_F1", results)
             self.assertIn("Average_RadGraph_F1", results)
@@ -240,6 +338,108 @@ class BasicEvalClinicalPipelineTest(unittest.IsolatedAsyncioTestCase):
             self.assertIn("RadGraph_F1", rows[0])
             self.assertIn("normalized_answer_text", rows[0])
             self.assertIn("_local_metrics_complete", rows[0])
+            self.assertIn("Entity_Hallucination_Rate", rows[0])
+            self.assertIn("Entity_Omission_Rate", rows[0])
+            self.assertIn("Entity_Factual_Precision", rows[0])
+
+    async def test_basic_eval_reports_bootstrap_ci_and_error_analysis(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = os.path.join(temp_dir, "input.png")
+            Image.new("RGB", (8, 8), color="white").save(image_path)
+            jsonl_path = os.path.join(temp_dir, "ci_eval.jsonl")
+            intermediate_path = os.path.join("eval_results", "ci_eval_local_metrics.jsonl")
+            if os.path.exists(intermediate_path):
+                os.remove(intermediate_path)
+
+            data = [
+                {
+                    "category": "VQA",
+                    "sub-category": "question-answering",
+                    "modality": "Radiograph",
+                    "input_image": image_path,
+                    "instruction": f"Describe this image (case {i}).",
+                    "choice": [],
+                    "answer": "A chest radiograph is shown.",
+                    "paper_task": "question-answering",
+                    "input_images": [image_path],
+                    "ground_truth_images": [],
+                    "sample_id": f"unit:test:ci:{i}",
+                    "eval_adapter": {"input_strategy": "single"},
+                    "response": f"A chest radiograph is shown (instance {i}).",
+                    "output_image": "",
+                }
+                for i in range(10)
+            ]
+
+            async def fake_text_metric(eval_texts, ref_texts, eval_metric):
+                return [1.0 for _ in eval_texts]
+
+            original_text_metric = eval_module.batch_async_evaluate_text_quality
+            original_radgraph = eval_module.compute_radgraph_f1
+            try:
+                eval_module.batch_async_evaluate_text_quality = fake_text_metric
+                eval_module.compute_radgraph_f1 = lambda response, reference: {
+                    "applicable": True, "f1": 0.9, "backend": "radgraph"
+                }
+                results = await eval_module.basic_eval(
+                    data=data,
+                    batch_size=4,
+                    task="vqa",
+                    data_path=temp_dir,
+                    jsonl_path=jsonl_path,
+                    run_vlm_judge=False,
+                )
+            finally:
+                eval_module.batch_async_evaluate_text_quality = original_text_metric
+                eval_module.compute_radgraph_f1 = original_radgraph
+
+            self.assertIn("Bootstrap95CI_Low_BLEU", results)
+            self.assertIn("Bootstrap95CI_High_BLEU", results)
+            self.assertIn("Average_Entity_Factual_Precision", results)
+            self.assertIn("Error_Analysis", results)
+            self.assertIn("by_modality", results["Error_Analysis"])
+            self.assertIn("failure_modes", results["Error_Analysis"])
+            self.assertEqual(results["Error_Analysis"]["sample_count"], 10)
+
+
+class ModelComparisonStatsTest(unittest.TestCase):
+    def test_analyze_model_comparison_pairwise_wilcoxon_and_ci(self) -> None:
+        import numpy as np
+        import random
+
+        random.seed(11)
+        rng = np.random.default_rng(11)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path_a = os.path.join(temp_dir, "model_a.jsonl")
+            path_b = os.path.join(temp_dir, "model_b.jsonl")
+            rows_a, rows_b = [], []
+            for i in range(20):
+                sample_id = f"sample:{i}"
+                rows_a.append({"sample_id": sample_id, "Anatomical_Embedding_Similarity": 0.90 + rng.uniform(-0.01, 0.01)})
+                rows_b.append({"sample_id": sample_id, "Anatomical_Embedding_Similarity": 0.95 + rng.uniform(-0.01, 0.01)})
+            with open(path_a, "w", encoding="utf-8") as handle:
+                for row in rows_a:
+                    handle.write(json.dumps(row) + "\n")
+            with open(path_b, "w", encoding="utf-8") as handle:
+                for row in rows_b:
+                    handle.write(json.dumps(row) + "\n")
+
+            result = asyncio.run(
+                eval_module.analyze_model_comparison([path_a, path_b], task="vqa", n_boot=100)
+            )
+
+        self.assertEqual(result["paired_sample_count"], 20)
+        self.assertIn("Anatomical_Embedding_Similarity", result["metrics"])
+        ssim_result = result["metrics"]["Anatomical_Embedding_Similarity"]
+        self.assertIn("model_a", ssim_result)
+        self.assertIn("model_b", ssim_result)
+        self.assertIn("ci_low", ssim_result["model_a"])
+        comparison = ssim_result["model_a_vs_model_b"]
+        if comparison["applicable"]:
+            self.assertTrue(comparison["significant_at_0.05"])
+            self.assertEqual(comparison["effect_direction"], "model_b>model_a")
+        else:
+            self.assertEqual(comparison.get("error"), "scipy 不可用")
 
 
 if __name__ == "__main__":

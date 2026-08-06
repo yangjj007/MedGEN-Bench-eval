@@ -124,7 +124,7 @@ class double_image_vlm:
     def __init__(
         self,
         config_path: str = "./api/config.yaml",
-        model_name: Optional[str] = "qwen3-vl-235b-a22b-instruct",
+        model_name: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
     ):
@@ -143,14 +143,14 @@ class double_image_vlm:
         # 配置优先级: 显式参数 > 配置文件 > 默认
         self.api_key = api_key or self.config.get("api_key") or ""
         self.base_url = base_url or self.config.get("base_url") or "https://aihubmix.com/v1"
-        self.model_name = model_name or self.config.get("model_name") or "qwen3-vl-235b-a22b-instruct"
+        self.model_name = model_name or self.config.get("model_name") or "google/medgemma-4b-it"
         self.temperature = self.config.get("temperature", 0.3)
 
         self.max_retries = int(self.config.get("max_retries", 1))
         self.retry_delay = float(self.config.get("retry_delay", 2))
 
         if not self.api_key:
-            raise ValueError("缺少 api_key，请在 ./api/config.yaml 中设置 api_key")
+            raise ValueError("缺少 api_key；本地 vLLM 也必须在配置中填写非空占位值，例如 EMPTY")
 
         # 站点信息（可选，用于统计/溯源）
         self.site_url = self.config.get("site_url", "")

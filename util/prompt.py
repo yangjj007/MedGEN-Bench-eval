@@ -180,3 +180,52 @@ Now please judge the generated output based on how well it fulfills the instruct
 
 ['\nYou are a helpful and impartial AI judge expert specialized in evaluating medical image-text generation model performance. You will be provided with instruction text and input images, as well as model-generated text or images for evaluation. Please assess whether the generated content successfully fulfills the requirements specified in the text instructions.\n\nImage Grounding Information:\nAll images contain artificially rendered black text at the bottom center to indicate the image type:\n- Input images are labeled with "Input"\n- Output images that model generate are labeled with "Output"\n\nJudge Requirement: Evaluate the model-generated content based on the following dimensions:\n1. Content Accuracy: The factual correctness of both textual information and visual elements, particularly important in medical contexts.\n2. Relevance and Responsiveness: How well the generated content addresses the given query and meets the specific requirements.\n3. Consistency: Whether the image type or text format align with the given instructions and maintain coherent style.\n',
     '', '\n\nOutput Requirement: Please output in JSON format, including scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score. The JSON should follow this structure:\n\n{{\n  "content_accuracy": {{\n    "score": 0,\n    "explanation": ""\n  }},\n  "relevance_and_responsiveness": {{\n    "score": 0,\n    "explanation": ""\n  }},\n  "consistency": {{\n    "score": 0,\n    "explanation": ""\n  }},\n', '', '\n  "overall_score": 0,\n  "final_thoughts": ""\n}}\n\nHere is the Instruction:\n', '\nHere is the Input (Text and Images):\n', '\nHere is the Generated Output (Text and Images):\n', '\nNow please judge the generated output based on how well it fulfills the instruction requirements. Remember to output in JSON format with scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score.\n']
+
+
+# --- 任务特定 judge 检查清单 ---
+# 保留 5 维临床评分（解剖准确性 / 临床发现准确性 / 指令遵循 / 跨模态一致性 /
+# 幻觉与遗漏控制），并为每个任务补充可观察的判定标准，减少 prompt 漂移。
+TASK_JUDGE_CHECKLISTS = {
+    'vqa': (
+        "1. Answer fidelity: the generated text answers the exact question asked, "
+        "not a related but different question.\n"
+        "2. Finding visibility: every reported finding is visible in the input image "
+        "and consistent with the ground-truth answer.\n"
+        "3. Clinical strictness: penalize invented findings, wrong laterality/site, "
+        "and internally contradictory statements.\n"
+        "4. Format match: modality, anatomy, and answer structure match the ground truth."
+    ),
+    'image_edit': (
+        "1. Transformation applied: the requested edit (artifact removal, contrast "
+        "enhancement, resolution editing, etc.) is actually present in the target region.\n"
+        "2. Context preserved: anatomy outside the edit region is unchanged and intact.\n"
+        "3. Artifact-free: penalize new blur, noise, or unrealistic textures introduced "
+        "by the edit.\n"
+        "4. Clinical plausibility: the edited image stays anatomically and clinically "
+        "consistent with the ground truth."
+    ),
+    'multimodal_generation': (
+        "1. Cross-modal agreement: generated image and text support the same disease "
+        "stage, anatomy, and findings.\n"
+        "2. Transformation plausibility: progression, reconstruction, and projection "
+        "changes are anatomically plausible.\n"
+        "3. No invented content: penalize structures, findings, or devices that do not "
+        "appear in the ground truth.\n"
+        "4. Format match: the output image-text pairing follows the instruction."
+    ),
+}
+
+
+def build_vlm_judge_prompt(task: str, with_gt: bool) -> list:
+    """按任务生成结构化检查清单 judge prompt（段布局与基础 prompt 一致）。"""
+    base = list(vlm_holistic_judge_w_gt_prompt if with_gt else vlm_holistic_judge_wo_gt_prompt)
+    checklist = TASK_JUDGE_CHECKLISTS.get(task, '')
+    if checklist:
+        base[0] = (
+            base[0]
+            + "\n\nTask-Specific Checklist ("
+            + str(task)
+            + "):\n"
+            + checklist
+        )
+    return base

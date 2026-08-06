@@ -12,8 +12,10 @@
 !/test_metrics_smoke.py
 !/test_clinical_text_metrics.py
 !/test_eval_clinical_integration.py
+!/test_clinical_image_metrics.py
 !/api/
 !/util/
+!/vllm_serve.sh
 
 # Local credentials, caches, generated data, and ad-hoc API fixtures.
 api/config.yaml

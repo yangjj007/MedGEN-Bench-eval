@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 # todo:下面代码的断点保存只保存了vlm judge的部分，而没有保存图片和文本metric，帮我加上
 
 # 告诉我需要修改的函数完整实现
@@ -13,7 +15,11 @@ from tqdm import tqdm
 from collections import defaultdict
 import logging
 
-from util.prompt import vlm_holistic_judge_w_gt_prompt, vlm_holistic_judge_wo_gt_prompt
+from util.prompt import (
+    vlm_holistic_judge_w_gt_prompt,
+    vlm_holistic_judge_wo_gt_prompt,
+    build_vlm_judge_prompt,
+)
 from util.format_parser import extract_json
 from util.clinical_text_metrics import (
     serialize_clinical_reference,
@@ -22,6 +28,8 @@ from util.clinical_text_metrics import (
     compute_text_em_f1,
     compute_clinical_entity_metrics,
     compute_radgraph_f1,
+    compute_entity_error_metrics,
+    compute_factual_precision_chexbert,
 )
 
 # Dataset/eval-input validation should not require model clients or heavyweight
@@ -29,27 +37,69 @@ from util.clinical_text_metrics import (
 EVAL_DEPENDENCY_ERROR = None
 try:
     from util.metrics import (
-        batch_async_FR_IQA,
         batch_async_evaluate_text_quality,
+        batch_async_FR_IQA,
+        batch_async_anatomical_metrics,
     )
     from api.get_vlm_res import double_image_vlm
 except ModuleNotFoundError as exc:
     EVAL_DEPENDENCY_ERROR = exc
-    batch_async_FR_IQA = None
     batch_async_evaluate_text_quality = None
+    batch_async_FR_IQA = None
+    batch_async_anatomical_metrics = None
     double_image_vlm = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 METRIC_THRESHOLDS = {
+    'Anatomical_Embedding_Similarity': {'lower_is_better': False, 'threshold': 0.7},
     'LPIPS': {'lower_is_better': True, 'threshold': 0.6},
     'PSNR': {'lower_is_better': False, 'threshold': 28.0},
-    'SSIM': {'lower_is_better': False, 'threshold': 0.1},
+    'SSIM': {'lower_is_better': False, 'threshold': 0.7},
     'BLEU': {'lower_is_better': False, 'threshold': 0.09},
     'BERT_Score': {'lower_is_better': False, 'threshold': 0.9},
+    'Entity_Hallucination_Rate': {'lower_is_better': True, 'threshold': 0.1},
+    'Entity_Omission_Rate': {'lower_is_better': True, 'threshold': 0.1},
+    'Entity_Factual_Precision': {'lower_is_better': False, 'threshold': 0.9},
     'VLM_Overall_Score_WO_GT': {'lower_is_better': False, 'threshold': 8.0},
     'VLM_Overall_Score_W_GT': {'lower_is_better': False, 'threshold': 8.0},
 }
+
+# The canonical Table IV view contains exactly these 16 paper tasks.  Keep the
+# list in one place so a renamed task cannot silently fall through to a generic
+# image metric or an unconditioned judge prompt.
+SUPPORTED_PAPER_TASKS = {
+    'multiple-choice', 'blank-filling', 'report-generation', 'question-answering',
+    'style-transfer', 'artifact-removal', 'noise-reconstruction',
+    'resolution-editing', 'contrast-enhancement', 'anatomical-annotation',
+    'disease-prediction', 'instruction-editing', 'organic-removal',
+    'organic-reconstruction', '3d-to-2d-projection', '2d-to-3d-reconstruction',
+}
+
+PAPER_TASK_ALIASES = {
+    'organ-removal': 'organic-removal',
+    'organ-reconstruction': 'organic-reconstruction',
+    '3d_to_2d_projection': '3d-to-2d-projection',
+    '2d_to_3d_reconstruction': '2d-to-3d-reconstruction',
+}
+
+
+def normalize_paper_task(value: object) -> str:
+    task_name = str(value or '').strip().lower().replace('_', '-')
+    return PAPER_TASK_ALIASES.get(task_name, task_name)
+
+
+def validate_paper_task(value: object) -> str:
+    task_name = normalize_paper_task(value)
+    if task_name not in SUPPORTED_PAPER_TASKS:
+        raise ValueError(
+            f"未知 paper_task={value!r}; 期望 Table IV 的 16 个任务之一: "
+            + ', '.join(sorted(SUPPORTED_PAPER_TASKS))
+        )
+    return task_name
+
+# Bootstrap 重采样次数（可通过环境变量覆盖，仅用于统计模块）。
+BOOTSTRAP_SAMPLES = max(100, int(os.environ.get('MEDGEN_BOOTSTRAP_SAMPLES', '1000')))
 
 def load_jsonl_data(jsonl_path: str) -> list:
     """从jsonl文件中加载数据"""
@@ -107,7 +157,8 @@ def validate_eval_input(data: list, task: str, data_path: str) -> dict:
                 else:
                     checked_images.add(os.path.realpath(path))
 
-        task_counts[str(item.get("paper_task") or item.get("sub-category"))] += 1
+        paper_task = validate_paper_task(item.get("paper_task") or item.get("sub-category"))
+        task_counts[paper_task] += 1
 
     if errors:
         raise ValueError(
@@ -164,7 +215,7 @@ def canonical_answer_text(item: dict) -> str:
     answer = item.get('answer', '')
     if isinstance(answer, dict):
         return serialize_clinical_reference(answer)
-    paper_task = str(item.get('paper_task') or item.get('sub-category') or '')
+    paper_task = normalize_paper_task(item.get('paper_task') or item.get('sub-category') or '')
     if paper_task in {'multiple-choice', 'blank-filling'}:
         return normalize_closed_form_answer(answer, item.get('choice') or [])
     return " ".join(str(answer or '').strip().split())
@@ -172,7 +223,7 @@ def canonical_answer_text(item: dict) -> str:
 
 def canonical_response_text(item: dict) -> str:
     response = str(item.get('response', '') or '')
-    paper_task = str(item.get('paper_task') or item.get('sub-category') or '')
+    paper_task = normalize_paper_task(item.get('paper_task') or item.get('sub-category') or '')
     if paper_task in {'multiple-choice', 'blank-filling'}:
         return normalize_closed_form_answer(response, item.get('choice') or [])
     return " ".join(response.strip().split())
@@ -181,7 +232,7 @@ def canonical_response_text(item: dict) -> str:
 def compute_text_metric_bundle(item: dict) -> dict:
     response_text = canonical_response_text(item)
     answer_text = canonical_answer_text(item)
-    paper_task = str(item.get('paper_task') or item.get('sub-category') or '')
+    paper_task = validate_paper_task(item.get('paper_task') or item.get('sub-category') or '')
 
     metrics = {
         'normalized_response_text': response_text,
@@ -206,6 +257,15 @@ def compute_text_metric_bundle(item: dict) -> dict:
     metrics['Clinical_Entity_R'] = clinical['recall']
     metrics['Clinical_Entity_F1'] = clinical['f1']
 
+    entity_errors = compute_entity_error_metrics(response_text, answer_text)
+    metrics['Entity_Hallucination_Rate'] = entity_errors['hallucination_rate']
+    metrics['Entity_Omission_Rate'] = entity_errors['omission_rate']
+    metrics['Entity_Factual_Precision'] = entity_errors['factual_precision']
+
+    chexbert_fp = compute_factual_precision_chexbert(response_text, answer_text)
+    if chexbert_fp is not None:
+        metrics['CheXbert_Factual_Precision'] = chexbert_fp
+
     radgraph = compute_radgraph_f1(response_text, answer_text)
     metrics['radgraph_applicable'] = radgraph['applicable']
     metrics['RadGraph_F1'] = radgraph['f1']
@@ -217,33 +277,248 @@ def append_metric_value(all_metrics: defaultdict, metric_name: str, value) -> No
         all_metrics[metric_name].append(float(value))
 
 
+def bootstrap_ci(values, n_boot: int = 1000, alpha: float = 0.05, seed: int = 42) -> dict:
+    """对单条指标输出 bootstrap 95% CI（替代仅 mean/std 的榜单式比较）。"""
+    arr = np.asarray([float(v) for v in values], dtype=float)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return {'mean': None, 'ci_low': None, 'ci_high': None, 'n_boot': 0}
+    rng = np.random.default_rng(seed)
+    means = np.empty(n_boot)
+    for i in range(n_boot):
+        means[i] = float(np.mean(rng.choice(arr, size=arr.size, replace=True)))
+    lo, hi = np.percentile(means, [100 * alpha / 2, 100 * (1 - alpha / 2)])
+    return {
+        'mean': float(np.mean(arr)),
+        'ci_low': float(lo),
+        'ci_high': float(hi),
+        'n_boot': int(n_boot),
+    }
+
+
+def paired_wilcoxon_test(scores_a, scores_b, metric_name: str) -> dict:
+    """对同一批样本的两组分数做配对 Wilcoxon signed-rank 检验。"""
+    try:
+        from scipy.stats import wilcoxon
+    except ImportError:
+        return {'metric': metric_name, 'applicable': False, 'error': 'scipy 不可用'}
+    arr_a = np.asarray([float(v) for v in scores_a], dtype=float)
+    arr_b = np.asarray([float(v) for v in scores_b], dtype=float)
+    mask = np.isfinite(arr_a) & np.isfinite(arr_b)
+    arr_a, arr_b = arr_a[mask], arr_b[mask]
+    if arr_a.size < 2:
+        return {'metric': metric_name, 'n': int(arr_a.size), 'applicable': False}
+    diff = arr_b - arr_a
+    if not np.any(diff != 0):
+        stat, p_value = 0.0, 1.0
+    else:
+        stat, p_value = wilcoxon(arr_a, arr_b, zero_method='wilcox')
+    mean_diff = float(np.mean(diff))
+    if abs(mean_diff) < 1e-12:
+        direction = 'equal'
+    elif mean_diff > 0:
+        direction = 'model_b>model_a'
+    else:
+        direction = 'model_a>model_b'
+    return {
+        'metric': metric_name,
+        'n': int(arr_a.size),
+        'statistic': float(stat),
+        'p_value': float(p_value),
+        'significant_at_0.05': bool(p_value < 0.05),
+        'mean_diff': mean_diff,
+        'effect_direction': direction,
+        'applicable': True,
+    }
+
+
+def classify_failure_modes(record: dict, task: str) -> list:
+    """把单条记录归入可解释的失败模式（供论文错误分析章节引用）。"""
+    modes = []
+    clinical_f1 = record.get('Clinical_Entity_F1')
+    hallucination = record.get('Entity_Hallucination_Rate')
+    omission = record.get('Entity_Omission_Rate')
+    judge = record.get('vlm_judge_w_gt_result')
+    instruction = (
+        judge.get('instruction_compliance', {}).get('score')
+        if isinstance(judge, dict)
+        else None
+    )
+
+    if isinstance(hallucination, (int, float)) and hallucination > 0:
+        modes.append('entity_hallucination')
+    if isinstance(omission, (int, float)) and omission > 0:
+        modes.append('entity_omission')
+    if isinstance(instruction, (int, float)) and instruction < 6:
+        modes.append('low_instruction_compliance')
+    return modes
+
+
+def build_error_analysis(records: dict, task: str) -> dict:
+    """按 modality / paper_task 分解指标，并统计失败模式分布。"""
+    items = [r for r in records.values() if isinstance(r, dict)]
+    by_modality = defaultdict(lambda: defaultdict(list))
+    by_paper_task = defaultdict(lambda: defaultdict(list))
+    modality_counts = defaultdict(int)
+    paper_task_counts = defaultdict(int)
+    failure_modes = defaultdict(list)
+
+    for item in items:
+        modality = str(item.get('modality') or 'unknown')
+        paper_task = str(item.get('paper_task') or item.get('sub-category') or 'unknown')
+        modality_counts[modality] += 1
+        paper_task_counts[paper_task] += 1
+        metric_values = metrics_from_record(item, task)
+        for metric_name, value in metric_values.items():
+            by_modality[modality][metric_name].append(value)
+            by_paper_task[paper_task][metric_name].append(value)
+        for mode in classify_failure_modes(item, task):
+            failure_modes[mode].append(item.get('sample_id') or generate_sample_id(item))
+
+    def summarize(group_metrics, group_counts):
+        out = {}
+        for group, metric_values in sorted(group_metrics.items()):
+            entry = {'Sample_Count': int(group_counts[group])}
+            for metric_name, values in sorted(metric_values.items()):
+                entry[f'Average_{metric_name}'] = float(np.mean(values))
+                entry[f'Std_{metric_name}'] = float(np.std(values))
+            out[group] = entry
+        return out
+
+    return {
+        'sample_count': len(items),
+        'by_modality': summarize(by_modality, modality_counts),
+        'by_paper_task': summarize(by_paper_task, paper_task_counts),
+        'failure_modes': {
+            mode: {'count': len(sample_ids), 'samples': sample_ids[:10]}
+            for mode, sample_ids in sorted(failure_modes.items())
+        },
+    }
+
+
+def load_result_records(jsonl_path: str) -> dict:
+    """读取已评测 JSONL，按 sample_id 建立 {id: record} 索引。"""
+    records = {}
+    for line in load_jsonl_data(jsonl_path):
+        if not isinstance(line, dict):
+            continue
+        sample_id = line.get('sample_id') or generate_sample_id(line)
+        records[str(sample_id)] = line
+    return records
+
+
+async def analyze_model_comparison(
+    jsonl_paths: list,
+    task: str,
+    n_boot: int = 1000,
+) -> dict:
+    """对同一模型集合的任意两模型结果做配对 Wilcoxon 检验 + bootstrap CI。
+
+    输入为多个已评测的 JSONL（同一样本集、不同模型输出），按 sample_id 配对。
+    """
+    if len(jsonl_paths) < 2:
+        raise ValueError('--mission stats 需要至少两个结果文件（同一样本集的不同模型输出）')
+    model_records = []
+    for path in jsonl_paths:
+        records = load_result_records(path)
+        if not records:
+            raise ValueError(f'结果文件为空: {path}')
+        model_records.append((path, records))
+
+    common_ids = set(model_records[0][1].keys())
+    for _, records in model_records[1:]:
+        common_ids &= set(records.keys())
+    common_ids = sorted(common_ids)
+    if len(common_ids) < 2:
+        raise ValueError('不同模型结果文件的 sample_id 交集过小，无法进行配对统计')
+
+    model_names = [os.path.splitext(os.path.basename(p))[0] for p in jsonl_paths]
+    # 先收集所有指标名
+    metric_names = set()
+    for _, records in model_records:
+        for sample_id in common_ids:
+            metric_names.update(metrics_from_record(records[sample_id], task).keys())
+
+    aligned = {metric_name: {} for metric_name in metric_names}
+    for metric_name in metric_names:
+        for model_name, (_, records) in zip(model_names, model_records):
+            aligned[metric_name][model_name] = [
+                metrics_from_record(records[sample_id], task).get(metric_name)
+                for sample_id in common_ids
+            ]
+
+    result = {
+        'models': model_names,
+        'result_files': jsonl_paths,
+        'paired_sample_count': len(common_ids),
+        'metrics': {},
+    }
+    for metric_name in sorted(metric_names):
+        metric_result = {}
+        for model_name in model_names:
+            metric_result[model_name] = bootstrap_ci(
+                [v for v in aligned[metric_name][model_name] if v is not None],
+                n_boot=n_boot,
+            )
+        for i in range(len(model_names)):
+            for j in range(i + 1, len(model_names)):
+                name_a, name_b = model_names[i], model_names[j]
+                pairs = [
+                    (a, b)
+                    for a, b in zip(aligned[metric_name][name_a], aligned[metric_name][name_b])
+                    if a is not None and b is not None
+                ]
+                comp = paired_wilcoxon_test(
+                    [p[0] for p in pairs],
+                    [p[1] for p in pairs],
+                    metric_name,
+                )
+                metric_result[f'{name_a}_vs_{name_b}'] = comp
+        result['metrics'][metric_name] = metric_result
+    return result
+
+
+def save_results_for_stats(results: dict, jsonl_paths: list):
+    """将多模型统计结果保存到 ./eval_results/。"""
+    output_dir = './eval_results'
+    os.makedirs(output_dir, exist_ok=True)
+    parts = [os.path.splitext(os.path.basename(p))[0] for p in jsonl_paths[:4]]
+    output_path = os.path.join(output_dir, '_'.join(parts) + '_stats_results.json')
+    with open(output_path, 'w', encoding='utf-8') as f:
+        json.dump(results, f, indent=4)
+    logging.info(f"统计结果已成功保存到: {output_path}")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="评估多模态模型生成结果的脚本")
     parser.add_argument('--data_path', type=str, default="./MedGEN", help='输入的jsonl文件路径')
-    parser.add_argument('--jsonl_path', type=str, required=True, help='输入的jsonl文件路径')
+    parser.add_argument('--jsonl_path', type=str, nargs='+', required=True, help='输入的jsonl文件路径（stats 模式可传多个）')
     parser.add_argument('--batch_size', type=int, default=8, help='处理数据的批大小')
-    parser.add_argument('--mission', type=str, choices=['basic_eval', 'type_wise'], default='basic_eval', help='评估任务类型')
+    parser.add_argument('--mission', type=str, choices=['basic_eval', 'type_wise', 'stats'], default='basic_eval', help='评估任务类型')
     parser.add_argument('--type_key', type=str, default='modality', help='当 mission 为 type_wise 时，用于分类的键名')
     parser.add_argument('--task', type=str, choices=['multimodal_generation', 'image_edit', 'vqa'], default='multimodal_generation', help='具体的评测任务类型 (multimodal_generation, image_edit, vqa)')
     parser.add_argument('--max_samples', type=int, default=None, help='只读取前N条记录')
+    parser.add_argument('--bootstrap_samples', type=int, default=BOOTSTRAP_SAMPLES, help='bootstrap 重采样次数（默认 1000）')
     parser.add_argument('--validate-only', action='store_true', help='仅校验评测输入和图片路径，不加载指标模型或调用API')
     parser.add_argument('--local-metrics-only', action='store_true', help='执行本地指标但跳过付费 VLM judge；仅支持 basic_eval')
-    parser.add_argument('--judge_model', type=str, default='', help='VLM judge 模型名')
-    parser.add_argument('--judge_backend', type=str, choices=['local_hf', 'api'], default='api', help='judge 后端类型')
+    parser.add_argument('--judge_model', type=str, default='', help='VLM judge 模型名（留空时从 --judge_config 读取）')
+    parser.add_argument('--judge_config', type=str, default='./api/config.vllm.yaml', help='本地 vLLM 医学 VLM judge 配置文件')
+    parser.add_argument('--judge_backend', type=str, choices=['api'], default='api', help='OpenAI-compatible API；默认指向本地 vLLM')
     parser.add_argument('--enable_clinical_text_metrics', action='store_true', default=True, help='开启 clinical text metrics')
     return parser
 
 
-def build_vlm_judge_client(run_vlm_judge: bool, judge_model: str | None, judge_backend: str):
+def build_vlm_judge_client(
+    run_vlm_judge: bool,
+    judge_model: str | None,
+    judge_backend: str,
+    judge_config: str = "./api/config.vllm.yaml",
+):
     if not run_vlm_judge:
         return None
-    selected_model = judge_model or "qwen3-vl-235b-a22b-instruct"
-    if judge_backend == 'local_hf':
-        logging.warning(
-            "judge_backend=local_hf 当前回退到现有 API judge 客户端；请确保网关可访问模型 %s",
-            selected_model,
-        )
-    return double_image_vlm(model_name=selected_model)
+    # 优先级: --judge_model > 配置文件 model_name > 默认 qwen3-vl
+    selected_model = judge_model or ""
+    return double_image_vlm(config_path=judge_config, model_name=selected_model)
 
 
 # async def basic_eval(data: list, batch_size: int, task: str, data_path: str, jsonl_path: str) -> dict:
@@ -479,12 +754,16 @@ async def basic_eval(
     run_vlm_judge: bool = True,
     judge_model: str | None = None,
     judge_backend: str = 'api',
+    judge_config: str = './api/config.vllm.yaml',
     enable_clinical_text_metrics: bool = True,
+    n_boot: int = BOOTSTRAP_SAMPLES,
 ) -> dict:
     """
     对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
     """
-    vlm_client = build_vlm_judge_client(run_vlm_judge, judge_model, judge_backend)
+    for item in data:
+        validate_paper_task(item.get('paper_task') or item.get('sub-category'))
+    vlm_client = build_vlm_judge_client(run_vlm_judge, judge_model, judge_backend, judge_config)
     all_metrics = defaultdict(list)
     text_metric_sample_count = 0
     radgraph_applicable_count = 0
@@ -525,8 +804,12 @@ async def basic_eval(
     for item in already_processed_items:
         # 加载图片和文本指标
         for metric_key in [
-            'LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score',
+            'LPIPS', 'PSNR', 'SSIM',
+            'Anatomical_Embedding_Similarity',
+            'BLEU', 'BERT_Score',
             'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+            'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
+            'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
             'Task_Accuracy', 'Text_EM', 'Text_F1'
         ]:
             if metric_key in item:
@@ -569,14 +852,9 @@ async def basic_eval(
             append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_WO_GT', judge_wo_gt.get('hallucination_omission_control', {}).get('score'))
             all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
 
-    # --- 动态调整 Prompt（保持原逻辑）---
-    current_vlm_holistic_judge_w_gt_prompt = list(vlm_holistic_judge_w_gt_prompt)
-    current_vlm_holistic_judge_wo_gt_prompt = list(vlm_holistic_judge_wo_gt_prompt)
-    if task != 'multimodal_generation':
-        current_vlm_holistic_judge_w_gt_prompt[1] = ""
-        current_vlm_holistic_judge_wo_gt_prompt[1] = ""
-        current_vlm_holistic_judge_w_gt_prompt[3] = ""
-        current_vlm_holistic_judge_wo_gt_prompt[3] = ""
+    # --- 按任务生成结构化检查清单 judge prompt（所有任务均覆盖 5 维临床评分）---
+    current_vlm_holistic_judge_w_gt_prompt = build_vlm_judge_prompt(task, with_gt=True)
+    current_vlm_holistic_judge_wo_gt_prompt = build_vlm_judge_prompt(task, with_gt=False)
 
     # 完整结果字典，用于每次覆盖写入
     full_results_dict = dict(existing_data)
@@ -609,6 +887,7 @@ async def basic_eval(
                             resolve_image_path(data_path, item['ground_truth_image'])
                         ).convert('RGB')
                     )
+                    validate_paper_task(item.get('paper_task') or item.get('sub-category'))
                 except (FileNotFoundError, IOError) as e:
                     logging.warning(f"无法加载图片，跳过图像指标计算: {e}")
             if task in ['multimodal_generation', 'vqa']:
@@ -621,6 +900,8 @@ async def basic_eval(
                     text_metric_sample_count += 1
                     for metric_key in [
                         'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+                        'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
+                        'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
                         'Task_Accuracy', 'Text_EM', 'Text_F1'
                     ]:
                         append_metric_value(all_metrics, metric_key, item.get(metric_key))
@@ -691,8 +972,7 @@ async def basic_eval(
 
 
         # --- 执行并保存图片和文本指标 ---
-        # Load PubMedBERT before LPIPS for mixed-modality batches.  On some
-        # CPU-only PyTorch builds the reverse first-use order can stall.
+        # Run text metrics and the frozen clinical image encoder in this batch.
         metric_specs = []
         if task in ['multimodal_generation', 'vqa'] and eval_texts:
             metric_specs.extend([
@@ -704,6 +984,7 @@ async def basic_eval(
                 ('LPIPS', len(eval_images), batch_async_FR_IQA(eval_images, ref_images, 'lpips')),
                 ('PSNR', len(eval_images), batch_async_FR_IQA(eval_images, ref_images, 'psnr')),
                 ('SSIM', len(eval_images), batch_async_FR_IQA(eval_images, ref_images, 'ssim')),
+                ('ANATOMICAL', len(eval_images), batch_async_anatomical_metrics(eval_images, ref_images)),
             ])
 
         metric_results = (
@@ -717,8 +998,16 @@ async def basic_eval(
                 logging.warning("metric %s 返回 None，跳过", metric_name)
                 continue
             if isinstance(scores, Exception):
-                logging.error("metric %s 失败: %s", metric_name, scores)
-                scores = [0.0] * sample_count
+                raise RuntimeError(f"metric {metric_name} failed; evaluation aborted") from scores
+            if metric_name == 'ANATOMICAL':
+                for item_idx, metric_dict in enumerate(scores):
+                    if not isinstance(metric_dict, dict):
+                        continue
+                    for sub_metric, value in metric_dict.items():
+                        if isinstance(value, (int, float)) and np.isfinite(value):
+                            all_metrics[sub_metric].append(float(value))
+                            batch_data[item_idx][sub_metric] = float(value)
+                continue
             all_metrics[metric_name].extend(scores)
             for item_idx, score in enumerate(scores):
                 batch_data[item_idx][metric_name] = score
@@ -916,6 +1205,10 @@ async def basic_eval(
             std_val = float(np.std(values))  # 计算标准差
             final_results[f"Average_{metric}"] = mean_val
             final_results[f"Std_{metric}"] = std_val  # 保存标准差
+            ci = bootstrap_ci(values, n_boot=n_boot)
+            if ci['mean'] is not None:
+                final_results[f"Bootstrap95CI_Low_{metric}"] = ci['ci_low']
+                final_results[f"Bootstrap95CI_High_{metric}"] = ci['ci_high']
 
             # 如果想打印出来
             print(f"{metric}: mean={mean_val:.4f}, std={std_val:.4f}")
@@ -924,15 +1217,25 @@ async def basic_eval(
     final_results.update(accuracy_rates)
     if text_metric_sample_count:
         final_results['RadGraph_Coverage'] = radgraph_applicable_count / text_metric_sample_count
+    final_results['Error_Analysis'] = build_error_analysis(full_results_dict, task)
 
     logging.info(f"评估完成。包含所有指标的中间结果已保存至: {intermediate_file}")
     return final_results
 
-async def basic_eval_for_type_wise(data: list, batch_size: int, task: str, data_path: str, jsonl_path: str) -> dict:
+async def basic_eval_for_type_wise(
+    data: list,
+    batch_size: int,
+    task: str,
+    data_path: str,
+    jsonl_path: str,
+    judge_config: str = './api/config.vllm.yaml',
+) -> dict:
     """
     对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
     """
-    vlm_client = double_image_vlm()
+    for item in data:
+        validate_paper_task(item.get('paper_task') or item.get('sub-category'))
+    vlm_client = double_image_vlm(config_path=judge_config)
     all_metrics = defaultdict(list)
 
 
@@ -979,7 +1282,14 @@ async def basic_eval_for_type_wise(data: list, batch_size: int, task: str, data_
     logging.info(f"发现 {len(already_processed_items)} 条已完整处理的样本，将直接加载其所有结果。")
     for item in already_processed_items:
         # 加载图片和文本指标
-        for metric_key in ['LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score']:
+        for metric_key in [
+            'Anatomical_Embedding_Similarity',
+            'BLEU', 'BERT_Score',
+            'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+            'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
+            'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
+            'Task_Accuracy', 'Text_EM', 'Text_F1'
+        ]:
             if metric_key in item:
                 all_metrics[metric_key].append(item[metric_key])
 
@@ -1005,14 +1315,9 @@ async def basic_eval_for_type_wise(data: list, batch_size: int, task: str, data_
             all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
             all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
 
-    # --- 动态调整 Prompt（保持原逻辑）---
-    current_vlm_holistic_judge_w_gt_prompt = list(vlm_holistic_judge_w_gt_prompt)
-    current_vlm_holistic_judge_wo_gt_prompt = list(vlm_holistic_judge_wo_gt_prompt)
-    if task != 'multimodal_generation':
-        current_vlm_holistic_judge_w_gt_prompt[1] = ""
-        current_vlm_holistic_judge_wo_gt_prompt[1] = ""
-        current_vlm_holistic_judge_w_gt_prompt[3] = ""
-        current_vlm_holistic_judge_wo_gt_prompt[3] = ""
+    # --- 按任务生成结构化检查清单 judge prompt ---
+    current_vlm_holistic_judge_w_gt_prompt = build_vlm_judge_prompt(task, with_gt=True)
+    current_vlm_holistic_judge_wo_gt_prompt = build_vlm_judge_prompt(task, with_gt=False)
 
     # 完整结果字典，用于每次覆盖写入
     full_results_dict = dict(existing_data)
@@ -1120,7 +1425,8 @@ async def basic_eval_for_type_wise(data: list, batch_size: int, task: str, data_
             metric_tasks.extend([
                 batch_async_FR_IQA(eval_images, ref_images, 'lpips'),
                 batch_async_FR_IQA(eval_images, ref_images, 'psnr'),
-                batch_async_FR_IQA(eval_images, ref_images, 'ssim')
+                batch_async_FR_IQA(eval_images, ref_images, 'ssim'),
+                batch_async_anatomical_metrics(eval_images, ref_images),
             ])
         if task in ['multimodal_generation', 'vqa'] and eval_texts:
             metric_tasks.extend([
@@ -1134,20 +1440,20 @@ async def basic_eval_for_type_wise(data: list, batch_size: int, task: str, data_
         if eval_images:
             for metric_name in ['LPIPS', 'PSNR', 'SSIM']:
                 scores = metric_results[res_idx]
-                
-                if scores is None:
-                    print(f"[WARN] metric {metric_name} 返回 None，跳过该条数据。")
-                    res_idx += 1
-                    continue
-                
-                if not isinstance(scores, Exception):
-                    all_metrics[metric_name].extend(scores)
-                    # 【核心修改】将指标保存回每个样本中
-                    for item_idx, score in enumerate(scores):
-                        batch_data[item_idx][metric_name] = score
-                else:
-                    all_metrics[metric_name].extend([0.0] * len(eval_images))
+                if isinstance(scores, Exception):
+                    raise RuntimeError(f"{metric_name} failed; evaluation aborted") from scores
+                all_metrics[metric_name].extend(scores)
+                for item_idx, score in enumerate(scores):
+                    batch_data[item_idx][metric_name] = score
                 res_idx += 1
+            scores = metric_results[res_idx]
+            if isinstance(scores, Exception):
+                raise RuntimeError("anatomical image metric failed; evaluation aborted") from scores
+            for item_idx, metric_dict in enumerate(scores):
+                for metric_name, score in metric_dict.items():
+                    all_metrics[metric_name].append(score)
+                    batch_data[item_idx][metric_name] = score
+            res_idx += 1
         if eval_texts:
             for metric_name in ['BLEU', 'BERT_Score']:
                 scores = metric_results[res_idx]
@@ -1163,7 +1469,7 @@ async def basic_eval_for_type_wise(data: list, batch_size: int, task: str, data_
                     for item_idx, score in enumerate(scores):
                         batch_data[item_idx][metric_name] = score
                 else:
-                    all_metrics[metric_name].extend([0.0] * len(eval_texts))
+                    raise RuntimeError(f"{metric_name} failed; evaluation aborted") from scores
                 res_idx += 1
 
         # # --- 打印调试信息 ---
@@ -1414,7 +1720,7 @@ async def eval_type_wise(data: list, batch_size: int, type_key: str, task: str, 
         logging.info(f"开始评估类型: '{modality_type}' (包含 {len(subset_data)} 个样本)")
         # 为每个子类生成独立的中间文件名（避免冲突）
         subset_jsonl_path = os.path.join(output_root, f"{modality_type}_{os.path.basename(jsonl_path)}")
-        all_results[modality_type] = await basic_eval_for_type_wise(subset_data, batch_size, task, data_path, subset_jsonl_path)
+        all_results[modality_type] = await basic_eval_for_type_wise(subset_data, batch_size, task, data_path, subset_jsonl_path, judge_config)
         print(all_results)
         # all_results[modality_type] = await basic_eval(subset_data, batch_size, task, data_path, subset_jsonl_path)
     
@@ -1505,8 +1811,12 @@ def metrics_from_record(item: dict, task: str) -> dict:
     """Extract already-computed local and VLM metrics from one result record."""
     metrics = {}
     for key in [
-        'LPIPS', 'PSNR', 'SSIM', 'BLEU', 'BERT_Score',
+        'LPIPS', 'PSNR', 'SSIM',
+        'Anatomical_Embedding_Similarity',
+        'BLEU', 'BERT_Score',
         'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+        'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
+        'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
         'RadGraph_F1', 'Task_Accuracy', 'Text_EM', 'Text_F1'
     ]:
         value = item.get(key)
@@ -1552,8 +1862,12 @@ async def aggregate_type_wise_results(
     type_key: str,
     task: str,
     jsonl_path: str,
+    n_boot: int = BOOTSTRAP_SAMPLES,
+    judge_config: str = './api/config.vllm.yaml',
 ) -> dict:
     """Aggregate metrics already present in an evaluated JSONL by a record key."""
+    for item in data:
+        validate_paper_task(item.get('paper_task') or item.get('sub-category'))
     grouped_data = defaultdict(list)
     for item in data:
         grouped_data[str(item.get(type_key, 'unknown'))].append(item)
@@ -1580,9 +1894,17 @@ async def aggregate_type_wise_results(
         for metric_name, values in sorted(group_metrics.items()):
             summary[f'Average_{metric_name}'] = float(np.mean(values))
             summary[f'Std_{metric_name}'] = float(np.std(values))
+            ci = bootstrap_ci(values, n_boot=n_boot)
+            if ci['mean'] is not None:
+                summary[f'Bootstrap95CI_Low_{metric_name}'] = ci['ci_low']
+                summary[f'Bootstrap95CI_High_{metric_name}'] = ci['ci_high']
         if radgraph_total:
             summary['RadGraph_Coverage'] = radgraph_applicable / radgraph_total
         summary.update(calculate_accuracy_rates(group_metrics))
+        summary['Error_Analysis'] = build_error_analysis(
+            {str(item.get('sample_id') or generate_sample_id(item)): item for item in records},
+            task,
+        )
         all_results[group_name] = summary
 
         safe_group = group_name.replace('/', '_').replace(os.sep, '_')
@@ -1599,8 +1921,17 @@ async def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
+    if args.mission == 'stats':
+        results = await analyze_model_comparison(
+            args.jsonl_path,
+            args.task,
+            n_boot=args.bootstrap_samples,
+        )
+        save_results_for_stats(results, args.jsonl_path)
+        return
+
     # 加载数据
-    data = load_jsonl_data(args.jsonl_path)
+    data = load_jsonl_data(args.jsonl_path[0])
     if args.max_samples is not None:
         if args.max_samples <= 0:
             raise ValueError('--max_samples 必须是正整数')
@@ -1622,6 +1953,7 @@ async def main():
     if args.local_metrics_only and args.mission != 'basic_eval':
         raise ValueError('--local-metrics-only 仅支持 --mission basic_eval')
 
+    jsonl_path = args.jsonl_path[0]
     # 执行评估
     if args.mission == 'basic_eval':
         results = await basic_eval(
@@ -1629,15 +1961,22 @@ async def main():
             args.batch_size,
             args.task,
             args.data_path,
-            args.jsonl_path,
+            jsonl_path,
             run_vlm_judge=not args.local_metrics_only,
             judge_model=args.judge_model,
             judge_backend=args.judge_backend,
+            judge_config=args.judge_config,
             enable_clinical_text_metrics=args.enable_clinical_text_metrics,
+            n_boot=args.bootstrap_samples,
         )
     elif args.mission == 'type_wise':
         results = await aggregate_type_wise_results(
-            data, args.type_key, args.task, args.jsonl_path
+            data,
+            args.type_key,
+            args.task,
+            jsonl_path,
+            n_boot=args.bootstrap_samples,
+            judge_config=args.judge_config,
         )
     else:
         logging.error(f"未知的 mission: {args.mission}")
@@ -1645,9 +1984,9 @@ async def main():
 
     # 保存结果
     if args.mission == 'type_wise':
-        save_results_for_type_wise(results, args.jsonl_path, args.task)
+        save_results_for_type_wise(results, jsonl_path, args.task)
     else:   
-        save_results(results, args.jsonl_path, args.task)
+        save_results(results, jsonl_path, args.task)
 
 if __name__ == '__main__':
     asyncio.run(main())

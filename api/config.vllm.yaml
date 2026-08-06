@@ -1,0 +1,10 @@
+# 本地 vLLM 医学 VLM judge 配置（配合 vllm_serve.sh 使用）。
+# base_url 指向 vLLM 的 OpenAI 兼容服务；api_key 为任意非空占位值（vLLM 默认不鉴权）。
+api_key: "EMPTY"
+base_url: "http://127.0.0.1:8000/v1"
+max_retries: 3
+model_name: "google/medgemma-4b-it"
+retry_delay: 2
+site_name: ""
+site_url: ""
+temperature: 0.0

@@ -8,9 +8,9 @@ import numpy as np
 from PIL import Image
 
 from util.metrics import (
-    FR_IQA,
-    batch_async_FR_IQA,
+    compute_anatomical_embedding_similarity,
     batch_async_evaluate_text_quality,
+    batch_async_anatomical_metrics,
     evaluate_text_quality,
 )
 
@@ -27,8 +27,6 @@ def make_images() -> tuple[Image.Image, Image.Image]:
 async def run(include_bertscore: bool) -> dict[str, float]:
     candidate, reference = make_images()
     scores = {
-        "PSNR": FR_IQA(candidate, reference, "psnr"),
-        "SSIM": FR_IQA(candidate, reference, "ssim"),
         "BLEU": evaluate_text_quality(
             "No acute cardiopulmonary abnormality.",
             "No acute cardiopulmonary abnormality.",
@@ -44,24 +42,16 @@ async def run(include_bertscore: bool) -> dict[str, float]:
         )
         assert async_bert[0] > 0.99
         scores["BERT_Score"] = async_bert[0]
-    async_images = {}
-    for metric in ("lpips", "psnr", "ssim"):
-        print(f"Testing {metric.upper()}...", flush=True)
-        async_images[metric] = (
-            await batch_async_FR_IQA([candidate], [reference], metric)
-        )[0]
-    scores["LPIPS"] = async_images["lpips"]
+    print("Testing Rad-DINO anatomical metric...", flush=True)
+    scores.update((await batch_async_anatomical_metrics([candidate], [reference]))[0])
+
     async_bleu = await batch_async_evaluate_text_quality(
         ["normal chest radiograph"], ["normal chest radiograph"], "bleu"
     )
     assert len(async_bleu) == 1
-    assert all(math.isfinite(value) for value in async_images.values())
     assert all(math.isfinite(value) for value in scores.values())
-    assert scores["LPIPS"] >= 0
-    assert scores["PSNR"] > 0
-    assert -1 <= scores["SSIM"] <= 1
+    assert -1 <= scores["Anatomical_Embedding_Similarity"] <= 1
     assert 0 <= scores["BLEU"] <= 1
-    assert FR_IQA(reference, reference, "psnr") == 100.0
     if include_bertscore:
         assert scores["BERT_Score"] > 0.99
     return scores

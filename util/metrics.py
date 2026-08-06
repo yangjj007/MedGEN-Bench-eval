@@ -198,41 +198,34 @@
 
 
 # todo：增加异步实现 ✅ 已完成 + 修复线程安全问题
+from __future__ import annotations
 import asyncio
-import lpips
 import numpy as np
 from PIL import Image
-from torchvision import transforms
-from skimage.metrics import structural_similarity as ssim
-from bert_score import score as bert_score
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
 from typing import List, Tuple, Union
 import functools
 import threading
 import os
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # Large shared servers often expose dozens of CPU cores.  Letting both LPIPS
 # and PubMedBERT create their default thread pools can make mixed-modality
 # evaluation stall from oversubscription.
 TORCH_NUM_THREADS = max(1, int(os.environ.get('MEDGEN_TORCH_NUM_THREADS', '4')))
-torch.set_num_threads(TORCH_NUM_THREADS)
+if torch is not None:
+    torch.set_num_threads(TORCH_NUM_THREADS)
 try:
-    torch.set_num_interop_threads(1)
+    if torch is not None:
+        torch.set_num_interop_threads(1)
 except RuntimeError:
     # Another importer may already have initialized the inter-op pool.
     pass
 
 # LPIPS is initialized lazily so --help/--validate-only never downloads weights.
-_lpips_model = None
-_lpips_model_lock = threading.Lock()
-lpips_preprocess = transforms.Compose([
-    transforms.Resize((256, 256)),
-    transforms.ToTensor(),
-    # LPIPS模型内部会进行归一化 (-1, 1)
-])
 # 用于计算BLEU的平滑函数
-nltk_smoothie = SmoothingFunction().method1
 
 # 并发控制 - 限制同时执行的深度学习推理任务数量
 CONCURRENT_DL_TASKS = 2
@@ -241,113 +234,137 @@ dl_semaphore = asyncio.Semaphore(CONCURRENT_DL_TASKS)
 # 线程安全锁，用于保护 BERT 模型访问
 bert_model_lock = threading.Lock()
 
-def get_lpips_model():
-    """Load the LPIPS network once, only when that metric is requested."""
+"""Clinical image metrics.
+
+The benchmark deliberately does not use pixel-level local metrics.  For
+radiology images, the primary image metric is a frozen radiology-pretrained
+representation (Rad-DINO), whose embedding similarity is a structural /
+anatomical proxy.  If its weights or dependencies are unavailable, evaluation
+fails instead of silently reporting a generic image-quality score.
+"""
+
+_RAD_DINO_MODEL = os.environ.get("MEDGEN_RAD_DINO_MODEL", "microsoft/rad-dino")
+_rad_dino_processor = None
+_rad_dino_model = None
+_rad_dino_lock = threading.Lock()
+
+_lpips_model = None
+_lpips_model_lock = threading.Lock()
+
+
+def _get_lpips_model():
     global _lpips_model
     if _lpips_model is None:
         with _lpips_model_lock:
             if _lpips_model is None:
-                _lpips_model = lpips.LPIPS(net='alex')
+                try:
+                    import lpips
+                except ImportError as exc:
+                    raise RuntimeError("LPIPS requested but lpips is not installed") from exc
+                _lpips_model = lpips.LPIPS(net="alex")
                 _lpips_model.eval()
     return _lpips_model
 
 
 def FR_IQA(eval_image: Image.Image, ref_image: Image.Image, eval_metric: str) -> float:
-    """
-    计算两张图片之间的全参考图像质量评估 (Full-Reference Image Quality Assessment)。
-
-    Args:
-        eval_image (Image.Image): 待评估的图片 (PIL.Image 对象)。
-        ref_image (Image.Image): 参考的基准图片 (PIL.Image 对象)。
-        eval_metric (str): 要使用的评估指标。支持 'lpips', 'psnr', 'ssim'。
-
-    Returns:
-        float: 计算出的评估分数。
-
-    Raises:
-        ValueError: 如果输入的 eval_metric 不被支持。
-    """    
+    """Full-image LPIPS/PSNR/SSIM metrics retained for the main image evaluation."""
     if eval_image.size != ref_image.size:
-        # 将待评估图像 resize 到参考图像的尺寸（保持内容，使用高质量插值）
         eval_image = eval_image.resize(ref_image.size, Image.Resampling.LANCZOS)
-
     metric = eval_metric.lower()
-
-    if metric == 'lpips':
-        # 对图像进行预处理并增加 batch 维度
-        eval_tensor = lpips_preprocess(eval_image).unsqueeze(0)
-        ref_tensor = lpips_preprocess(ref_image).unsqueeze(0)
-
-        # 使用LPIPS模型计算相似性 (分数越低，相似度越高)
+    if metric == "lpips":
+        if torch is None:
+            raise RuntimeError("LPIPS requested but torch is not installed")
+        try:
+            from torchvision import transforms
+        except ImportError as exc:
+            raise RuntimeError("LPIPS requested but torchvision is not installed") from exc
+        preprocess = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+        ])
+        candidate = preprocess(eval_image).unsqueeze(0)
+        reference = preprocess(ref_image).unsqueeze(0)
         with torch.inference_mode():
-            similarity_score = get_lpips_model()(eval_tensor, ref_tensor)
-        return similarity_score.item()
-
-    elif metric == 'psnr':
-        # 将 PIL Image 对象转换为 NumPy 数组 (OpenCV BGR 格式)
-        # 注意：PIL是RGB, OpenCV是BGR。但对于PSNR计算，只要两张图的通道顺序一致即可。
-        # 我们这里统一使用RGB顺序的Numpy数组。
-        ref_np = np.asarray(ref_image, dtype=np.float32)
-        eval_np = np.asarray(eval_image, dtype=np.float32)
-
-        # 确保图像数据类型正确
-        # 计算均方误差 (MSE)
-        mse = np.mean((ref_np - eval_np) ** 2)
-        if mse == 0:
-            # Keep evaluation artifacts valid JSON while representing a
-            # practically perfect 8-bit reconstruction.
-            return 100.0
-        
-        # 计算PSNR (分数越高，图像质量越好)
-        max_pixel_value = 255.0
-        psnr_score = 20 * np.log10(max_pixel_value / np.sqrt(mse))
-        return psnr_score
-
-    elif metric == 'ssim':
-        # 将 PIL Image 转换为灰度 NumPy 数组
-        # 也可以在多通道上计算, 这里为了和原始示例保持一致转为灰度
-        ref_gray = np.array(ref_image.convert('L'))
-        eval_gray = np.array(eval_image.convert('L'))
-        
-        # 计算 SSIM (分数在-1到1之间，越接近1，结构越相似)
-        # PIL conversion produces 8-bit grayscale; use the dtype range so
-        # constant images do not result in data_range=0.
-        ssim_score = ssim(ref_gray, eval_gray, data_range=255)
-        return ssim_score
-
-    else:
-        raise ValueError(
-            f"未知的图像评估指标: '{eval_metric}'. "
-            "支持的指标: 'lpips', 'psnr', 'ssim'."
-        )
+            return float(_get_lpips_model()(candidate, reference).item())
+    if metric == "psnr":
+        candidate = np.asarray(eval_image, dtype=np.float32)
+        reference = np.asarray(ref_image, dtype=np.float32)
+        mse = float(np.mean((candidate - reference) ** 2))
+        return 100.0 if mse == 0 else float(20 * np.log10(255.0 / np.sqrt(mse)))
+    if metric == "ssim":
+        try:
+            from skimage.metrics import structural_similarity
+        except ImportError as exc:
+            raise RuntimeError("SSIM requested but scikit-image is not installed") from exc
+        return float(structural_similarity(
+            np.asarray(ref_image.convert("L")),
+            np.asarray(eval_image.convert("L")),
+            data_range=255,
+        ))
+    raise ValueError(f"Unknown full-image metric: {eval_metric!r}; expected lpips, psnr, or ssim")
 
 
-async def async_FR_IQA(eval_image: Image.Image, ref_image: Image.Image, eval_metric: str) -> float:
-    """
-    异步版本的全参考图像质量评估。
-    
-    对于计算密集型任务（LPIPS、PSNR、SSIM），使用线程池避免阻塞事件循环。
-    
-    Args:
-        eval_image (Image.Image): 待评估的图片 (PIL.Image 对象)。
-        ref_image (Image.Image): 参考的基准图片 (PIL.Image 对象)。
-        eval_metric (str): 要使用的评估指标。支持 'lpips', 'psnr', 'ssim'。
+async def batch_async_FR_IQA(
+    eval_images: List[Image.Image], ref_images: List[Image.Image], eval_metric: str
+) -> List[float]:
+    if len(eval_images) != len(ref_images):
+        raise ValueError("eval_images and ref_images must have equal length")
+    return [FR_IQA(candidate, reference, eval_metric)
+            for candidate, reference in zip(eval_images, ref_images)]
 
-    Returns:
-        float: 计算出的评估分数。
-    """
-    metric = eval_metric.lower()
-    
-    if metric == 'lpips':
-        # As with BERTScore, initialize/run the CPU torch model on the main
-        # event-loop thread to avoid first-use deadlocks in worker threads.
-        async with dl_semaphore:
-            return FR_IQA(eval_image, ref_image, eval_metric)
-    else:
-        # Run the small NumPy/scikit-image operations serially as well. Mixing
-        # their native thread pools with first-use torch inference caused
-        # hangs on CPU-only hosts.
-        return FR_IQA(eval_image, ref_image, eval_metric)
+
+def _get_rad_dino():
+    global _rad_dino_processor, _rad_dino_model
+    if _rad_dino_model is not None:
+        return _rad_dino_processor, _rad_dino_model
+    with _rad_dino_lock:
+        if _rad_dino_model is None:
+            try:
+                from transformers import AutoImageProcessor, AutoModel
+                _rad_dino_processor = AutoImageProcessor.from_pretrained(_RAD_DINO_MODEL)
+                _rad_dino_model = AutoModel.from_pretrained(_RAD_DINO_MODEL)
+                _rad_dino_model.eval()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Anatomical metric {_RAD_DINO_MODEL!r} is unavailable; "
+                    "download the model and install transformers."
+                ) from exc
+    return _rad_dino_processor, _rad_dino_model
+
+
+def _image_embedding(image: Image.Image) -> torch.Tensor:
+    processor, model = _get_rad_dino()
+    try:
+        inputs = processor(images=image.convert("RGB"), return_tensors="pt")
+        with torch.inference_mode():
+            outputs = model(**inputs)
+        hidden = getattr(outputs, "pooler_output", None)
+        if hidden is None:
+            hidden = outputs.last_hidden_state[:, 0]
+        return torch.nn.functional.normalize(hidden.float(), dim=-1)[0]
+    except Exception as exc:
+        raise RuntimeError("Rad-DINO anatomical embedding inference failed") from exc
+
+
+def compute_anatomical_embedding_similarity(
+    eval_image: Image.Image, ref_image: Image.Image
+) -> float:
+    """Cosine similarity from frozen radiology-pretrained Rad-DINO embeddings."""
+    candidate = _image_embedding(eval_image)
+    reference = _image_embedding(ref_image)
+    return float(torch.clamp(torch.dot(candidate, reference), -1.0, 1.0).item())
+
+
+async def batch_async_anatomical_metrics(
+    eval_images: List[Image.Image], ref_images: List[Image.Image]
+) -> List[dict]:
+    if len(eval_images) != len(ref_images):
+        raise ValueError("eval_images and ref_images must have equal length")
+    return [
+        {"Anatomical_Embedding_Similarity": compute_anatomical_embedding_similarity(e, r)}
+        for e, r in zip(eval_images, ref_images)
+    ]
+
 
 
 def evaluate_text_quality_thread_safe(eval_text: str, ref_text: str, eval_metric: str) -> float:
@@ -372,6 +389,7 @@ def evaluate_text_quality_thread_safe(eval_text: str, ref_text: str, eval_metric
                 preds = [eval_text]
                 refs = [ref_text]
 
+                from bert_score import score as bert_score
                 _, _, f1 = bert_score(
                     preds,
                     refs,
@@ -391,12 +409,16 @@ def evaluate_text_quality_thread_safe(eval_text: str, ref_text: str, eval_metric
                 raise RuntimeError(f"BERTScore 计算失败: {e}") from e
 
     elif metric == 'bleu':
+        try:
+            from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
+        except ImportError as exc:
+            raise RuntimeError("BLEU requested but nltk is not installed") from exc
         # BLEU 分数需要将句子分割成词列表
         reference = [ref_text.split()]  # 参考文本可以是多个，所以是列表的列表
         candidate = eval_text.split()   # 预测文本只有一个
         
         # 使用平滑函数计算 BLEU 分数，避免n-gram匹配为0导致分数为0
-        bleu_score = sentence_bleu(reference, candidate, smoothing_function=nltk_smoothie)
+        bleu_score = sentence_bleu(reference, candidate, smoothing_function=SmoothingFunction().method1)
         return bleu_score
 
     else:
@@ -457,14 +479,9 @@ async def batch_async_FR_IQA(
         List[float]: 评估分数列表
     """
     if len(eval_images) != len(ref_images):
-        raise ValueError("eval_images 和 ref_images 长度必须相同")
-    
-    tasks = [
-        async_FR_IQA(eval_img, ref_img, eval_metric)
-        for eval_img, ref_img in zip(eval_images, ref_images)
-    ]
-    
-    return await asyncio.gather(*tasks)
+        raise ValueError("eval_images and ref_images must have equal length")
+    return [FR_IQA(candidate, reference, eval_metric)
+            for candidate, reference in zip(eval_images, ref_images)]
 
 
 async def batch_async_evaluate_text_quality(
@@ -511,6 +528,7 @@ def batch_bertscore_calculation(eval_texts: List[str], ref_texts: List[str]) -> 
     """
     try:
         with bert_model_lock:
+            from bert_score import score as bert_score
             _, _, f1_scores = bert_score(
                 eval_texts,
                 ref_texts,

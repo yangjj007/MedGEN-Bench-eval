@@ -1,12 +1,16 @@
 -r requirements-base.txt
 
-# Full local metrics used by eval.py. Install CPU torch/torchvision first when
+# Clinical text and anatomical embedding metrics. Install CPU torch first when
 # no CUDA runtime is needed (see README.md).
 bert-score>=0.3.13,<1
 lpips>=0.1.4,<1
 nltk>=3.8,<4
 radgraph>=0.1.18,<0.2
 scikit-image>=0.22,<1
+scipy>=1.10,<2
 torch>=2.3,<3
 torchvision>=0.18,<1
 transformers>=4.30,<5
+# Frozen radiology-pretrained encoder used by Anatomical_Embedding_Similarity.
+# Its weights are intentionally downloaded at evaluation time and never replaced
+# by a generic image metric.
