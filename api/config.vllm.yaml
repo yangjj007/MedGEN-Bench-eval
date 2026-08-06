@@ -3,7 +3,7 @@
 api_key: "EMPTY"
 base_url: "http://127.0.0.1:8000/v1"
 max_retries: 3
-model_name: "google/medgemma-4b-it"
+model_name: "google/medgemma-1.5-4b-it"
 retry_delay: 2
 site_name: ""
 site_url: ""

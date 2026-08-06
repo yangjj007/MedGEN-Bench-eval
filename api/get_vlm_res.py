@@ -143,7 +143,7 @@ class double_image_vlm:
         # 配置优先级: 显式参数 > 配置文件 > 默认
         self.api_key = api_key or self.config.get("api_key") or ""
         self.base_url = base_url or self.config.get("base_url") or "https://aihubmix.com/v1"
-        self.model_name = model_name or self.config.get("model_name") or "google/medgemma-4b-it"
+        self.model_name = model_name or self.config.get("model_name") or "google/medgemma-1.5-4b-it"
         self.temperature = self.config.get("temperature", 0.3)
 
         self.max_retries = int(self.config.get("max_retries", 1))

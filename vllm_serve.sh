@@ -3,12 +3,12 @@
 # vllm_serve.sh — 用 vLLM 启动本地医学 VLM（OpenAI 兼容 API），作为 MedGEN-Bench 的 VLM judge。
 #
 # 用法:
-#   bash vllm_serve.sh                                # 默认模型 MedGemma-4B-IT，端口 8000
+#   bash vllm_serve.sh                                # 默认模型 MedGemma 1.5 4B-IT，端口 8000
 #   MODEL_NAME=Qwen/Qwen2.5-VL-7B-Instruct bash vllm_serve.sh
 #   PORT=8010 GPU_MEMORY_UTILIZATION=0.85 bash vllm_serve.sh
 #
 # 可用环境变量:
-#   MODEL_NAME              HF 模型 ID（默认 google/medgemma-4b-it）
+#   MODEL_NAME              HF 模型 ID（默认 google/medgemma-1.5-4b-it）
 #   SERVED_MODEL_NAME       对外暴露的模型名（默认同 MODEL_NAME，需与 api/config.vllm.yaml 的 model_name 一致）
 #   PORT                    服务端口（默认 8000）
 #   HOST                    监听地址（默认 0.0.0.0）
@@ -21,7 +21,7 @@
 #
 set -euo pipefail
 
-MODEL_NAME="${MODEL_NAME:-google/medgemma-4b-it}"
+MODEL_NAME="${MODEL_NAME:-google/medgemma-1.5-4b-it}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$MODEL_NAME}"
 PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"

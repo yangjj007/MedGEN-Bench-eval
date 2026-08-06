@@ -77,16 +77,48 @@ SUPPORTED_PAPER_TASKS = {
 }
 
 PAPER_TASK_ALIASES = {
+    # Historical baseline JSONL names.
+    'multi-choice': 'multiple-choice',
+    'question-answer': 'question-answering',
+    'resolution-edit': 'resolution-editing',
+    'instruction-edit': 'instruction-editing',
+    'dye-transfer': 'style-transfer',
+    '3d-2d-projection': '3d-to-2d-projection',
+    '2d-3d-reconstruction': '2d-to-3d-reconstruction',
     'organ-removal': 'organic-removal',
     'organ-reconstruction': 'organic-reconstruction',
-    '3d_to_2d_projection': '3d-to-2d-projection',
-    '2d_to_3d_reconstruction': '2d-to-3d-reconstruction',
+}
+
+GENERIC_PAPER_TASK_NAMES = {
+    'image-edit',
+    'image-editing',
+    'multimodal-generation',
+    'generate',
+    'generation',
 }
 
 
 def normalize_paper_task(value: object) -> str:
     task_name = str(value or '').strip().lower().replace('_', '-')
     return PAPER_TASK_ALIASES.get(task_name, task_name)
+
+
+def paper_task_for_item(item: dict) -> str:
+    """Resolve canonical task names from current and historical result JSONL.
+
+    Older baseline exports sometimes stored a generic mission name in
+    ``paper_task`` and the actual Table IV task in ``sub-category``.  Prefer
+    that specific sub-category in this case.  Historical names such as
+    ``dye-transfer`` are aliases of the canonical 16-task taxonomy.
+    """
+    raw_task = item.get('paper_task')
+    raw_subtask = item.get('sub-category') or item.get('paper_subtask')
+    normalized_task = normalize_paper_task(raw_task)
+    if raw_subtask and (
+        not normalized_task or normalized_task in GENERIC_PAPER_TASK_NAMES
+    ):
+        return normalize_paper_task(raw_subtask)
+    return normalized_task or normalize_paper_task(raw_subtask)
 
 
 def validate_paper_task(value: object) -> str:
@@ -157,19 +189,44 @@ def validate_eval_input(data: list, task: str, data_path: str) -> dict:
                 else:
                     checked_images.add(os.path.realpath(path))
 
-        paper_task = validate_paper_task(item.get("paper_task") or item.get("sub-category"))
+        paper_task = validate_paper_task(paper_task_for_item(item))
         task_counts[paper_task] += 1
 
     if errors:
         raise ValueError(
             f"评测输入验证失败，共 {len(errors)} 个错误:\n" + "\n".join(errors[:50])
         )
+    present_tasks = set(task_counts)
+    missing_tasks = sorted(SUPPORTED_PAPER_TASKS - present_tasks)
     return {
         "records": len(data),
         "task": task,
         "paper_tasks": dict(sorted(task_counts.items())),
+        "expected_paper_task_count": len(SUPPORTED_PAPER_TASKS),
+        "present_paper_task_count": len(present_tasks),
+        "missing_paper_tasks": missing_tasks,
+        "paper_task_coverage_complete": not missing_tasks,
         "resolved_image_count": len(checked_images),
         "missing_images": 0,
+    }
+
+
+def task_coverage(data: list) -> dict:
+    """Summarize coverage against the canonical 16-task taxonomy.
+
+    A model-specific inference file is allowed to contain only a subset of
+    tasks.  The missing-task list is nevertheless persisted in every
+    aggregate so partial baseline exports cannot be mistaken for full
+    benchmark coverage.
+    """
+    present = sorted({paper_task_for_item(item) for item in data})
+    missing = sorted(SUPPORTED_PAPER_TASKS - set(present))
+    return {
+        'expected_task_count': len(SUPPORTED_PAPER_TASKS),
+        'present_task_count': len(present),
+        'present_tasks': present,
+        'missing_tasks': missing,
+        'complete': not missing,
     }
 
 
@@ -195,27 +252,41 @@ import hashlib
 
 
 def generate_sample_id(item: dict) -> str:
-    keys = ['instruction', 'answer', 'output_image']
-    parts = []
-    for k in keys:
-        v = item.get(k)
-        if v is not None:
-            parts.append(str(v))
-    if not parts:
-        item_str = json.dumps(item, sort_keys=True, ensure_ascii=False)
-        uid = hashlib.md5(item_str.encode('utf-8')).hexdigest()
-    else:
-        combined = '|'.join(parts)
-        uid = hashlib.md5(combined.encode('utf-8')).hexdigest()
+    """Return a stable, collision-resistant ID for one inference record.
 
-    return uid
+    The old implementation used only ``instruction``, ``answer`` and
+    ``output_image``.  VQA records commonly have no output image and reuse
+    the same answer across several questions, so that scheme silently
+    merged distinct samples during checkpoint resume.  Prefer explicit IDs
+    when present, but always bind them to the task/input context so repeated
+    IDs from different task variants remain distinct.
+    """
+    metadata = item.get('metadata')
+    metadata = metadata if isinstance(metadata, dict) else {}
+    explicit_id = item.get('sample_id') or metadata.get('sample_id') or metadata.get('unique_id')
+
+    stable_fields = {
+        'explicit_id': str(explicit_id or ''),
+        'category': item.get('category'),
+        'paper_task': paper_task_for_item(item),
+        'sub_category': item.get('sub-category') or item.get('paper_subtask'),
+        'modality': item.get('modality'),
+        'input_image': item.get('input_image'),
+        'ground_truth_image': item.get('ground_truth_image'),
+        'output_image': item.get('output_image'),
+        'instruction': item.get('instruction'),
+        'choice': item.get('choice'),
+        'answer': item.get('answer'),
+    }
+    payload = json.dumps(stable_fields, sort_keys=True, ensure_ascii=False, default=str)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
 def canonical_answer_text(item: dict) -> str:
     answer = item.get('answer', '')
     if isinstance(answer, dict):
         return serialize_clinical_reference(answer)
-    paper_task = normalize_paper_task(item.get('paper_task') or item.get('sub-category') or '')
+    paper_task = normalize_paper_task(paper_task_for_item(item))
     if paper_task in {'multiple-choice', 'blank-filling'}:
         return normalize_closed_form_answer(answer, item.get('choice') or [])
     return " ".join(str(answer or '').strip().split())
@@ -223,7 +294,7 @@ def canonical_answer_text(item: dict) -> str:
 
 def canonical_response_text(item: dict) -> str:
     response = str(item.get('response', '') or '')
-    paper_task = normalize_paper_task(item.get('paper_task') or item.get('sub-category') or '')
+    paper_task = normalize_paper_task(paper_task_for_item(item))
     if paper_task in {'multiple-choice', 'blank-filling'}:
         return normalize_closed_form_answer(response, item.get('choice') or [])
     return " ".join(response.strip().split())
@@ -232,7 +303,7 @@ def canonical_response_text(item: dict) -> str:
 def compute_text_metric_bundle(item: dict) -> dict:
     response_text = canonical_response_text(item)
     answer_text = canonical_answer_text(item)
-    paper_task = validate_paper_task(item.get('paper_task') or item.get('sub-category') or '')
+    paper_task = validate_paper_task(paper_task_for_item(item))
 
     metrics = {
         'normalized_response_text': response_text,
@@ -365,7 +436,7 @@ def build_error_analysis(records: dict, task: str) -> dict:
 
     for item in items:
         modality = str(item.get('modality') or 'unknown')
-        paper_task = str(item.get('paper_task') or item.get('sub-category') or 'unknown')
+        paper_task = paper_task_for_item(item) or 'unknown'
         modality_counts[modality] += 1
         paper_task_counts[paper_task] += 1
         metric_values = metrics_from_record(item, task)
@@ -500,6 +571,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--max_samples', type=int, default=None, help='只读取前N条记录')
     parser.add_argument('--bootstrap_samples', type=int, default=BOOTSTRAP_SAMPLES, help='bootstrap 重采样次数（默认 1000）')
     parser.add_argument('--validate-only', action='store_true', help='仅校验评测输入和图片路径，不加载指标模型或调用API')
+    parser.add_argument('--require-full-task-coverage', action='store_true', help='要求输入覆盖全部16个论文任务；否则仅报告缺失任务')
     parser.add_argument('--local-metrics-only', action='store_true', help='执行本地指标但跳过付费 VLM judge；仅支持 basic_eval')
     parser.add_argument('--judge_model', type=str, default='', help='VLM judge 模型名（留空时从 --judge_config 读取）')
     parser.add_argument('--judge_config', type=str, default='./api/config.vllm.yaml', help='本地 vLLM 医学 VLM judge 配置文件')
@@ -516,7 +588,7 @@ def build_vlm_judge_client(
 ):
     if not run_vlm_judge:
         return None
-    # 优先级: --judge_model > 配置文件 model_name > 默认 qwen3-vl
+    # 优先级: --judge_model > 配置文件 model_name > 默认医学 VLM
     selected_model = judge_model or ""
     return double_image_vlm(config_path=judge_config, model_name=selected_model)
 
@@ -762,7 +834,7 @@ async def basic_eval(
     对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
     """
     for item in data:
-        validate_paper_task(item.get('paper_task') or item.get('sub-category'))
+        validate_paper_task(paper_task_for_item(item))
     vlm_client = build_vlm_judge_client(run_vlm_judge, judge_model, judge_backend, judge_config)
     all_metrics = defaultdict(list)
     text_metric_sample_count = 0
@@ -887,9 +959,11 @@ async def basic_eval(
                             resolve_image_path(data_path, item['ground_truth_image'])
                         ).convert('RGB')
                     )
-                    validate_paper_task(item.get('paper_task') or item.get('sub-category'))
+                    validate_paper_task(paper_task_for_item(item))
                 except (FileNotFoundError, IOError) as e:
-                    logging.warning(f"无法加载图片，跳过图像指标计算: {e}")
+                    raise RuntimeError(
+                        f"无法加载图像，不能生成完整本地指标: {e}"
+                    ) from e
             if task in ['multimodal_generation', 'vqa']:
                 if enable_clinical_text_metrics:
                     bundle = compute_text_metric_bundle(item)
@@ -993,12 +1067,24 @@ async def basic_eval(
             )
             if metric_specs else []
         )
+        if task in ['multimodal_generation', 'image_edit'] and len(eval_images) != len(batch_data):
+            raise RuntimeError(
+                f"图像指标输入不完整: batch={len(batch_data)}, images={len(eval_images)}"
+            )
+        if task in ['multimodal_generation', 'vqa'] and len(eval_texts) != len(batch_data):
+            raise RuntimeError(
+                f"文本指标输入不完整: batch={len(batch_data)}, texts={len(eval_texts)}"
+            )
         for (metric_name, sample_count, _), scores in zip(metric_specs, metric_results):
             if scores is None:
                 logging.warning("metric %s 返回 None，跳过", metric_name)
                 continue
             if isinstance(scores, Exception):
                 raise RuntimeError(f"metric {metric_name} failed; evaluation aborted") from scores
+            if len(scores) != sample_count:
+                raise RuntimeError(
+                    f"metric {metric_name} returned {len(scores)} scores for {sample_count} samples"
+                )
             if metric_name == 'ANATOMICAL':
                 for item_idx, metric_dict in enumerate(scores):
                     if not isinstance(metric_dict, dict):
@@ -1218,6 +1304,7 @@ async def basic_eval(
     if text_metric_sample_count:
         final_results['RadGraph_Coverage'] = radgraph_applicable_count / text_metric_sample_count
     final_results['Error_Analysis'] = build_error_analysis(full_results_dict, task)
+    final_results['Task_Coverage'] = task_coverage(data)
 
     logging.info(f"评估完成。包含所有指标的中间结果已保存至: {intermediate_file}")
     return final_results
@@ -1234,7 +1321,7 @@ async def basic_eval_for_type_wise(
     对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
     """
     for item in data:
-        validate_paper_task(item.get('paper_task') or item.get('sub-category'))
+        validate_paper_task(paper_task_for_item(item))
     vlm_client = double_image_vlm(config_path=judge_config)
     all_metrics = defaultdict(list)
 
@@ -1867,7 +1954,7 @@ async def aggregate_type_wise_results(
 ) -> dict:
     """Aggregate metrics already present in an evaluated JSONL by a record key."""
     for item in data:
-        validate_paper_task(item.get('paper_task') or item.get('sub-category'))
+        validate_paper_task(paper_task_for_item(item))
     grouped_data = defaultdict(list)
     for item in data:
         grouped_data[str(item.get(type_key, 'unknown'))].append(item)
@@ -1890,7 +1977,7 @@ async def aggregate_type_wise_results(
                 if item.get('radgraph_applicable'):
                     radgraph_applicable += 1
 
-        summary = {'Sample_Count': len(records)}
+        summary = {'Sample_Count': len(records), 'Task_Coverage': task_coverage(data)}
         for metric_name, values in sorted(group_metrics.items()):
             summary[f'Average_{metric_name}'] = float(np.mean(values))
             summary[f'Std_{metric_name}'] = float(np.std(values))
@@ -1941,6 +2028,11 @@ async def main():
 
     if args.validate_only:
         summary = validate_eval_input(data, args.task, args.data_path)
+        if args.require_full_task_coverage and not summary['paper_task_coverage_complete']:
+            raise ValueError(
+                '输入未覆盖全部16个论文任务，缺失: '
+                + ', '.join(summary['missing_paper_tasks'])
+            )
         print("评测输入验证通过（未加载指标模型、未调用API）:")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
@@ -1954,6 +2046,12 @@ async def main():
         raise ValueError('--local-metrics-only 仅支持 --mission basic_eval')
 
     jsonl_path = args.jsonl_path[0]
+    coverage = task_coverage(data)
+    if args.require_full_task_coverage and not coverage['complete']:
+        raise ValueError(
+            '输入未覆盖全部16个论文任务，缺失: '
+            + ', '.join(coverage['missing_tasks'])
+        )
     # 执行评估
     if args.mission == 'basic_eval':
         results = await basic_eval(

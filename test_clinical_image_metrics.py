@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for the clinical-aligned image metrics (local region + task checks)."""
+"""Unit tests for the clinical-aligned image metrics and task checks."""
 
 from __future__ import annotations
 

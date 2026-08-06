@@ -167,12 +167,12 @@ python eval.py --data_path ./MedGEN_TableIV \
 
 ### VLM judge 升级（`util/prompt.py`）
 - 保留 5 维临床评分（`anatomical_accuracy`、`clinical_finding_accuracy`、`instruction_compliance`、`cross_modal_consistency`、`hallucination_omission_control`），并新增按任务（vqa / image_edit / multimodal_generation）区分的结构化检查清单，每个维度给出可观察判定标准，减少 prompt 漂移。
-- judge 默认配置为本地 `google/medgemma-4b-it`，可通过 `--judge_model` 和 vLLM 配置切换其他医学 VLM。
+- judge 默认配置为本地较新的医学 VLM `google/medgemma-1.5-4b-it`（2026-01 发布），可通过 `--judge_model` 和 vLLM 配置切换其他医学 VLM。
 
 ### 本地 vLLM 医学 VLM judge（默认）
 
 - 安装 vLLM（需 GPU 与 CUDA 环境）：`pip install -U vllm`。
-- 启动服务（默认模型 `google/medgemma-4b-it`，面向医学场景的本地多模态模型）：
+- 启动服务（默认模型 `google/medgemma-1.5-4b-it`，面向医学场景的本地多模态模型）：
 
 ```bash
 bash vllm_serve.sh
@@ -188,10 +188,10 @@ python eval.py --data_path ./MedGEN_TableIV \
   --jsonl_path ./inference_jsonl/tableiv/qwen3-vl-235b-a22b-instruct_vqa.jsonl \
   --task vqa --mission basic_eval --batch_size 8 \
   --judge_config ./api/config.vllm.yaml \
-  --judge_model google/medgemma-4b-it
+  --judge_model google/medgemma-1.5-4b-it
 ```
 
-- 模型优先级：`--judge_model` > `--judge_config` 中的 `model_name` > 默认 `google/medgemma-4b-it`；`api/config.vllm.yaml` 的 `api_key` 为占位值 `EMPTY`（vLLM 默认不鉴权）。
+- 模型优先级：`--judge_model` > `--judge_config` 中的 `model_name` > 默认 `google/medgemma-1.5-4b-it`；`api/config.vllm.yaml` 的 `api_key` 为占位值 `EMPTY`（vLLM 默认不鉴权）。
 - 客户端走标准 OpenAI 兼容接口（图片以 base64 data-URI 传入），与 vLLM 的 `/v1/chat/completions` 天然兼容；`type_wise` 聚合同样接受 `--judge_config`。
 - 已知偏倚风险：数据筛选/质检阶段 GPT-4o 与 Qwen3-VL 等模型参与过，同类模型作为被评估对象时可能引入偏倚。论文中应披露，并用下方专家一致性校准流程量化 judge 可靠性。
 

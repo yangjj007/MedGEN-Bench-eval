@@ -224,6 +224,20 @@ except RuntimeError:
     # Another importer may already have initialized the inter-op pool.
     pass
 
+
+def _metric_device():
+    """Select one device consistently for all local neural image/text metrics."""
+    if torch is None:
+        return 'cpu'
+    requested = os.environ.get('MEDGEN_METRIC_DEVICE', '').strip()
+    if requested:
+        if requested.startswith('cuda') and not torch.cuda.is_available():
+            raise RuntimeError(
+                f'MEDGEN_METRIC_DEVICE={requested!r} requested CUDA, but CUDA is unavailable'
+            )
+        return requested
+    return 'cuda' if torch.cuda.is_available() else 'cpu'
+
 # LPIPS is initialized lazily so --help/--validate-only never downloads weights.
 # 用于计算BLEU的平滑函数
 
@@ -261,7 +275,7 @@ def _get_lpips_model():
                     import lpips
                 except ImportError as exc:
                     raise RuntimeError("LPIPS requested but lpips is not installed") from exc
-                _lpips_model = lpips.LPIPS(net="alex")
+                _lpips_model = lpips.LPIPS(net="alex").to(_metric_device())
                 _lpips_model.eval()
     return _lpips_model
 
@@ -282,8 +296,9 @@ def FR_IQA(eval_image: Image.Image, ref_image: Image.Image, eval_metric: str) ->
             transforms.Resize((256, 256)),
             transforms.ToTensor(),
         ])
-        candidate = preprocess(eval_image).unsqueeze(0)
-        reference = preprocess(ref_image).unsqueeze(0)
+        device = _metric_device()
+        candidate = preprocess(eval_image).unsqueeze(0).to(device)
+        reference = preprocess(ref_image).unsqueeze(0).to(device)
         with torch.inference_mode():
             return float(_get_lpips_model()(candidate, reference).item())
     if metric == "psnr":
@@ -322,7 +337,7 @@ def _get_rad_dino():
             try:
                 from transformers import AutoImageProcessor, AutoModel
                 _rad_dino_processor = AutoImageProcessor.from_pretrained(_RAD_DINO_MODEL)
-                _rad_dino_model = AutoModel.from_pretrained(_RAD_DINO_MODEL)
+                _rad_dino_model = AutoModel.from_pretrained(_RAD_DINO_MODEL).to(_metric_device())
                 _rad_dino_model.eval()
             except Exception as exc:
                 raise RuntimeError(
@@ -335,7 +350,11 @@ def _get_rad_dino():
 def _image_embedding(image: Image.Image) -> torch.Tensor:
     processor, model = _get_rad_dino()
     try:
-        inputs = processor(images=image.convert("RGB"), return_tensors="pt")
+        device = _metric_device()
+        inputs = {
+            key: value.to(device) if hasattr(value, 'to') else value
+            for key, value in processor(images=image.convert("RGB"), return_tensors="pt").items()
+        }
         with torch.inference_mode():
             outputs = model(**inputs)
         hidden = getattr(outputs, "pooler_output", None)
@@ -397,7 +416,7 @@ def evaluate_text_quality_thread_safe(eval_text: str, ref_text: str, eval_metric
                     lang="en",
                     rescale_with_baseline=False,
                     num_layers=12,
-                    device='cpu',
+                    device=_metric_device(),
                     # device='cuda' if torch.cuda.is_available() else 'cpu',
                     #batch_size=16,
                     verbose=False  # 减少输出
@@ -529,14 +548,41 @@ def batch_bertscore_calculation(eval_texts: List[str], ref_texts: List[str]) -> 
     try:
         with bert_model_lock:
             from bert_score import score as bert_score
+            # PubMedBERT has a hard 512-position limit.  Keep the clinical
+            # entity/RadGraph metrics on the original full report, but make
+            # the embedding metric well-defined for long generated reports.
+            # Tokenization is done with the same tokenizer BERTScore uses so
+            # truncation is by model tokens rather than arbitrary characters.
+            from transformers import AutoTokenizer
+            tokenizer = AutoTokenizer.from_pretrained(
+                "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract"
+            )
+
+            def truncate_for_bertscore(text: str) -> str:
+                encoded = tokenizer(
+                    str(text or ""),
+                    add_special_tokens=True,
+                    truncation=True,
+                    max_length=512,
+                )
+                return tokenizer.decode(
+                    encoded["input_ids"],
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                )
+
+            bertscore_texts = (
+                [truncate_for_bertscore(text) for text in eval_texts],
+                [truncate_for_bertscore(text) for text in ref_texts],
+            )
             _, _, f1_scores = bert_score(
-                eval_texts,
-                ref_texts,
+                bertscore_texts[0],
+                bertscore_texts[1],
                 model_type="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract",
                 lang="en",
                 rescale_with_baseline=False,
                 num_layers=12,
-                device='cpu',
+                device=_metric_device(),
                 #device='cuda' if torch.cuda.is_available() else 'cpu',
                 verbose=False
             )
