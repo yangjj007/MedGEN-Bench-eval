@@ -1,203 +1,3 @@
-# # todo：增加异步实现，支持输入列表（选做）
-# import lpips
-# import numpy as np
-# from PIL import Image
-# from torchvision import transforms
-# from skimage.metrics import structural_similarity as ssim
-# from bert_score import score as bert_score
-# from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-
-# # --- 模型和预处理工具初始化 (推荐在全局范围执行一次) ---
-# # 避免在函数调用时重复加载，提高效率
-# lpips_model = lpips.LPIPS(net='alex') # 'alex' 或 'vgg'
-# lpips_preprocess = transforms.Compose([
-#     transforms.Resize((256, 256)),
-#     transforms.ToTensor(),
-#     # LPIPS模型内部会进行归一化 (-1, 1)
-# ])
-# # 用于计算BLEU的平滑函数
-# nltk_smoothie = SmoothingFunction().method1
-
-
-# def FR_IQA(eval_image: Image.Image, ref_image: Image.Image, eval_metric: str) -> float:
-#     """
-#     计算两张图片之间的全参考图像质量评估 (Full-Reference Image Quality Assessment)。
-
-#     Args:
-#         eval_image (Image.Image): 待评估的图片 (PIL.Image 对象)。
-#         ref_image (Image.Image): 参考的基准图片 (PIL.Image 对象)。
-#         eval_metric (str): 要使用的评估指标。支持 'lpips', 'psnr', 'ssim'。
-
-#     Returns:
-#         float: 计算出的评估分数。
-
-#     Raises:
-#         ValueError: 如果输入的 eval_metric 不被支持。
-#     """
-#     metric = eval_metric.lower()
-
-#     if metric == 'lpips':
-#         # 对图像进行预处理并增加 batch 维度
-#         eval_tensor = lpips_preprocess(eval_image).unsqueeze(0)
-#         ref_tensor = lpips_preprocess(ref_image).unsqueeze(0)
-
-#         # 使用LPIPS模型计算相似性 (分数越低，相似度越高)
-#         similarity_score = lpips_model(eval_tensor, ref_tensor)
-#         return similarity_score.item()
-
-#     elif metric == 'psnr':
-#         # 将 PIL Image 对象转换为 NumPy 数组 (OpenCV BGR 格式)
-#         # 注意：PIL是RGB, OpenCV是BGR。但对于PSNR计算，只要两张图的通道顺序一致即可。
-#         # 我们这里统一使用RGB顺序的Numpy数组。
-#         ref_np = np.array(ref_image)
-#         eval_np = np.array(eval_image)
-
-#         # 确保图像数据类型正确
-#         if ref_np.dtype != np.uint8:
-#             ref_np = (ref_np * 255).astype(np.uint8)
-#         if eval_np.dtype != np.uint8:
-#             eval_np = (eval_np * 255).astype(np.uint8)
-        
-#         # 计算均方误差 (MSE)
-#         mse = np.mean((ref_np - eval_np) ** 2)
-#         if mse == 0:
-#             # MSE为0意味着图片完全相同，PSNR为无穷大
-#             return float('inf')
-        
-#         # 计算PSNR (分数越高，图像质量越好)
-#         max_pixel_value = 255.0
-#         psnr_score = 20 * np.log10(max_pixel_value / np.sqrt(mse))
-#         return psnr_score
-
-#     elif metric == 'ssim':
-#         # 将 PIL Image 转换为灰度 NumPy 数组
-#         # 也可以在多通道上计算, 这里为了和原始示例保持一致转为灰度
-#         ref_gray = np.array(ref_image.convert('L'))
-#         eval_gray = np.array(eval_image.convert('L'))
-        
-#         # 计算 SSIM (分数在-1到1之间，越接近1，结构越相似)
-#         # data_range是像素值的范围
-#         ssim_score = ssim(ref_gray, eval_gray, data_range=ref_gray.max() - ref_gray.min())
-#         return ssim_score
-
-
-#     else:
-#         raise ValueError(
-#             f"未知的图像评估指标: '{eval_metric}'. "
-#             "支持的指标: 'lpips', 'psnr', 'ssim'."
-#         )
-
-
-
-
-# def evaluate_text_quality(eval_text: str, ref_text: str, eval_metric: str) -> float:
-#     """
-#     评估生成文本相对于参考文本的质量。
-
-#     Args:
-#         eval_text (str): 待评估的文本 (例如，模型生成的摘要)。
-#         ref_text (str): 参考的基准文本 (例如，人工编写的摘要)。
-#         eval_metric (str): 要使用的评估指标。支持 'bertscore', 'bleu'。
-
-#     Returns:
-#         float: 计算出的评估分数。
-
-#     Raises:
-#         ValueError: 如果输入的 eval_metric 不被支持。
-#     """
-#     metric = eval_metric.lower()
-
-#     if metric == 'bertscore':
-#         # bert-score 需要输入为列表
-#         preds = [eval_text]
-#         refs = [ref_text]
-
-#         _, _, f1 = bert_score(
-#             preds,
-#             refs,
-#             model_type="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract",
-#             lang="en",
-#             rescale_with_baseline=False,
-#             num_layers=12,
-#             device='cpu'  # 如果有GPU，可以改为 'cuda'
-#         )
-        
-        
-#         return f1.mean().item()
-
-#     elif metric == 'bleu':
-#         # BLEU 分数需要将句子分割成词列表
-#         reference = [ref_text.split()]  # 参考文本可以是多个，所以是列表的列表
-#         candidate = eval_text.split()   # 预测文本只有一个
-        
-#         # 使用平滑函数计算 BLEU 分数，避免n-gram匹配为0导致分数为0
-#         bleu_score = sentence_bleu(reference, candidate, smoothing_function=nltk_smoothie)
-#         return bleu_score
-
-#     else:
-#         raise ValueError(
-#             f"未知的文本评估指标: '{eval_metric}'. "
-#             "支持的指标: 'bertscore', 'bleu'."
-#         )
-
-
-# # --- 主函数入口和示例 ---
-# if __name__ == '__main__':
-#     # ==========================
-#     # 图像评估函数 FR_IQA 示例
-#     # ==========================
-#     print("--- 图像质量评估 (FR-IQA) 示例 ---")
-#     # 创建两个示例图片 (实际使用时请用 Image.open('filepath.jpg') 加载)
-#     # ref_img 是一个纯黑色的图片
-#     ref_img = Image.new('RGB', (256, 256), color='black')
-#     # eval_img 是一个带有一些灰色噪声的图片
-#     noise = np.random.randint(0, 50, (256, 256, 3), dtype=np.uint8)
-#     eval_img = Image.fromarray(np.array(ref_img) + noise)
-    
-#     # 1. 计算 LPIPS
-#     lpips_score = FR_IQA(eval_img, ref_img, 'lpips')
-#     print(f"LPIPS Score: {lpips_score:.4f} (越低越好)")
-
-#     # 2. 计算 PSNR
-#     psnr_score = FR_IQA(eval_img, ref_img, 'psnr')
-#     print(f"PSNR Score: {psnr_score:.4f} dB (越高越好)")
-    
-#     # 3. 计算 SSIM
-#     ssim_score = FR_IQA(eval_img, ref_img, 'ssim')
-#     print(f"SSIM Score: {ssim_score:.4f} (越接近1越好)")
-
-
-#     print("\n" + "="*40 + "\n")
-
-#     # ============================
-#     # 文本评估函数 evaluate_text_quality 示例
-#     # ============================
-#     print("--- 文本质量评估示例 ---")
-#     # 示例文本
-#     reference_text = "Normal stomach mucosa (negative for Helicobacter Pylori infection)"
-#     predicted_text_good = "The gastric mucosa appears normal with no evidence of H. pylori infection"
-#     predicted_text_bad = "computed tomography"
-
-#     # 1. 计算 BERTScore (与好预测的比较)
-#     bertscore_good = evaluate_text_quality(predicted_text_good, reference_text, 'bertscore')
-#     print(f"BERTScore (Good Match): {bertscore_good:.4f} (越接近1越好)")
-    
-#     # 2. 计算 BERTScore (与差预测的比较)
-#     bertscore_bad = evaluate_text_quality(predicted_text_bad, reference_text, 'bertscore')
-#     print(f"BERTScore (Bad Match): {bertscore_bad:.4f} (越接近1越好)")
-
-#     print("-" * 20)
-    
-#     # 3. 计算 BLEU (与好预测的比较)
-#     bleu_good = evaluate_text_quality(predicted_text_good, reference_text, 'bleu')
-#     print(f"BLEU Score (Good Match): {bleu_good:.4f} (越接近1越好)")
-    
-#     # 4. 计算 BLEU (与差预测的比较)
-#     bleu_bad = evaluate_text_quality(predicted_text_bad, reference_text, 'bleu')
-#     print(f"BLEU Score (Bad Match): {bleu_bad:.4f} (越接近1越好)")
-
-
-# todo：增加异步实现 ✅ 已完成 + 修复线程安全问题
 from __future__ import annotations
 import asyncio
 import numpy as np
@@ -239,28 +39,39 @@ def _metric_device():
     return 'cuda' if torch.cuda.is_available() else 'cpu'
 
 # LPIPS is initialized lazily so --help/--validate-only never downloads weights.
-# 用于计算BLEU的平滑函数
 
-# 并发控制 - 限制同时执行的深度学习推理任务数量
+# Limit concurrent deep-learning inference tasks.
 CONCURRENT_DL_TASKS = 2
 dl_semaphore = asyncio.Semaphore(CONCURRENT_DL_TASKS)
 
-# 线程安全锁，用于保护 BERT 模型访问
+# Protect BERT model access across threads.
 bert_model_lock = threading.Lock()
+_bertscore_scorer = None
+_bertscore_tokenizer = None
+_bertscore_cache_key = None
 
 """Clinical image metrics.
 
-The benchmark deliberately does not use pixel-level local metrics.  For
-radiology images, the primary image metric is a frozen radiology-pretrained
-representation (Rad-DINO), whose embedding similarity is a structural /
-anatomical proxy.  If its weights or dependencies are unavailable, evaluation
-fails instead of silently reporting a generic image-quality score.
+The benchmark keeps full-image LPIPS/PSNR/SSIM for image fidelity, and uses
+MedImageInsight as its medical-image representation metric.  MedImageInsight
+was trained across several imaging modalities (rather than being a
+chest-radiograph-only encoder), so its cosine similarity is a broader
+medical-image representation proxy.  It is still not a lesion-localization
+or clinical-truth metric; the implementation therefore fails loudly when the
+model or its local dependencies are unavailable.
 """
 
-_RAD_DINO_MODEL = os.environ.get("MEDGEN_RAD_DINO_MODEL", "microsoft/rad-dino")
-_rad_dino_processor = None
-_rad_dino_model = None
-_rad_dino_lock = threading.Lock()
+_MEDIMAGEINSIGHT_DIR = os.environ.get(
+    "MEDGEN_MEDIMAGEINSIGHT_DIR",
+    "~/.cache/medgen-bench/MedImageInsights",
+)
+_MEDIMAGEINSIGHT_VISION_WEIGHTS = os.environ.get(
+    "MEDGEN_MEDIMAGEINSIGHT_WEIGHTS", "2024.09.27/vision_model/medimageinsigt-v1.0.0.pt"
+)
+_medimageinsight_model = None
+_medimageinsight_preprocess = None
+_medimageinsight_device = None
+_medimageinsight_lock = threading.Lock()
 
 _lpips_model = None
 _lpips_model_lock = threading.Lock()
@@ -300,7 +111,12 @@ def FR_IQA(eval_image: Image.Image, ref_image: Image.Image, eval_metric: str) ->
         candidate = preprocess(eval_image).unsqueeze(0).to(device)
         reference = preprocess(ref_image).unsqueeze(0).to(device)
         with torch.inference_mode():
-            return float(_get_lpips_model()(candidate, reference).item())
+            # ``ToTensor`` produces values in [0, 1], whereas the official
+            # LPIPS implementation expects [-1, 1] unless ``normalize`` is
+            # set.  Passing raw [0, 1] tensors silently changes the feature
+            # normalization and makes the distance non-comparable with the
+            # published LPIPS scale.
+            return float(_get_lpips_model()(candidate, reference, normalize=True).item())
     if metric == "psnr":
         candidate = np.asarray(eval_image, dtype=np.float32)
         reference = np.asarray(ref_image, dtype=np.float32)
@@ -324,87 +140,148 @@ async def batch_async_FR_IQA(
 ) -> List[float]:
     if len(eval_images) != len(ref_images):
         raise ValueError("eval_images and ref_images must have equal length")
+    # LPIPS is the only neural full-reference metric in this helper.  Evaluate
+    # a whole caller batch together so a corrected audit of the frozen outputs
+    # does not repeatedly launch AlexNet for every image pair.
+    if eval_metric.lower() == "lpips" and eval_images:
+        if torch is None:
+            raise RuntimeError("LPIPS requested but torch is not installed")
+        try:
+            from torchvision import transforms
+        except ImportError as exc:
+            raise RuntimeError("LPIPS requested but torchvision is not installed") from exc
+        preprocess = transforms.Compose([
+            transforms.Resize((256, 256)),
+            transforms.ToTensor(),
+        ])
+        device = _metric_device()
+        candidates = torch.stack([preprocess(image) for image in eval_images]).to(device)
+        references = torch.stack([preprocess(image) for image in ref_images]).to(device)
+        with torch.inference_mode():
+            scores = _get_lpips_model()(candidates, references, normalize=True)
+        return [float(score) for score in scores.reshape(-1).detach().cpu().tolist()]
     return [FR_IQA(candidate, reference, eval_metric)
             for candidate, reference in zip(eval_images, ref_images)]
 
 
-def _get_rad_dino():
-    global _rad_dino_processor, _rad_dino_model
-    if _rad_dino_model is not None:
-        return _rad_dino_processor, _rad_dino_model
-    with _rad_dino_lock:
-        if _rad_dino_model is None:
+def _get_medimageinsight():
+    """Load the pinned MedImageInsight checkpoint once per worker process."""
+    global _medimageinsight_model, _medimageinsight_preprocess, _medimageinsight_device
+    if _medimageinsight_model is not None:
+        return _medimageinsight_model, _medimageinsight_preprocess, _medimageinsight_device
+    with _medimageinsight_lock:
+        if _medimageinsight_model is None:
+            if torch is None:
+                raise RuntimeError("MedImageInsight requested but torch is not installed")
+            model_root = os.path.abspath(os.path.expanduser(_MEDIMAGEINSIGHT_DIR))
+            config_path = os.path.join(model_root, "2024.09.27", "config.yaml")
+            weights_path = os.path.join(model_root, _MEDIMAGEINSIGHT_VISION_WEIGHTS)
+            tokenizer_dir = os.path.join(
+                model_root, "2024.09.27", "language_model", "clip_tokenizer_4.16.2"
+            )
+            required = [config_path, weights_path, tokenizer_dir]
+            missing = [path for path in required if not os.path.exists(path)]
+            if missing:
+                raise RuntimeError(
+                    "MedImageInsight is unavailable. Missing local files: "
+                    + ", ".join(missing)
+                    + ". Download lion-ai/MedImageInsights and set "
+                    "MEDGEN_MEDIMAGEINSIGHT_DIR."
+                )
             try:
-                from transformers import AutoImageProcessor, AutoModel
-                _rad_dino_processor = AutoImageProcessor.from_pretrained(_RAD_DINO_MODEL)
-                _rad_dino_model = AutoModel.from_pretrained(_RAD_DINO_MODEL).to(_metric_device())
-                _rad_dino_model.eval()
+                import sys
+                from MedImageInsight.Utils.Arguments import load_opt_from_config_files
+                from MedImageInsight.ImageDataLoader import build_transforms
+                from MedImageInsight.UniCLModel import build_unicl_model
+            except Exception:
+                try:
+                    if model_root not in sys.path:
+                        sys.path.insert(0, model_root)
+                    from MedImageInsight.Utils.Arguments import load_opt_from_config_files
+                    from MedImageInsight.ImageDataLoader import build_transforms
+                    from MedImageInsight.UniCLModel import build_unicl_model
+                except Exception as exc:
+                    raise RuntimeError(
+                        "MedImageInsight source/dependencies are unavailable; "
+                        "install its pinned dependencies (yacs, fvcore, mup, timm, "
+                        "safetensors, einops, ftfy)."
+                    ) from exc
+            try:
+                if model_root not in sys.path:
+                    sys.path.insert(0, model_root)
+                opt = load_opt_from_config_files([config_path])
+                opt["LANG_ENCODER"]["PRETRAINED_TOKENIZER"] = tokenizer_dir
+                opt["UNICL_MODEL"]["PRETRAINED"] = weights_path
+                preprocess = build_transforms(opt, False)
+                model = build_unicl_model(opt)
+                device = torch.device(_metric_device())
+                model.to(device)
+                model.eval()
             except Exception as exc:
                 raise RuntimeError(
-                    f"Anatomical metric {_RAD_DINO_MODEL!r} is unavailable; "
-                    "download the model and install transformers."
+                    "MedImageInsight failed to initialize from the local checkpoint"
                 ) from exc
-    return _rad_dino_processor, _rad_dino_model
+            _medimageinsight_model = model
+            _medimageinsight_preprocess = preprocess
+            _medimageinsight_device = device
+    return _medimageinsight_model, _medimageinsight_preprocess, _medimageinsight_device
 
 
-def _image_embedding(image: Image.Image) -> torch.Tensor:
-    processor, model = _get_rad_dino()
+def _medimageinsight_embeddings(images: List[Image.Image]) -> torch.Tensor:
+    if not images:
+        return torch.empty((0, 0))
+    model, preprocess, device = _get_medimageinsight()
     try:
-        device = _metric_device()
-        inputs = {
-            key: value.to(device) if hasattr(value, 'to') else value
-            for key, value in processor(images=image.convert("RGB"), return_tensors="pt").items()
-        }
+        inputs = torch.stack([preprocess(image.convert("RGB")) for image in images]).to(device)
         with torch.inference_mode():
-            outputs = model(**inputs)
-        hidden = getattr(outputs, "pooler_output", None)
-        if hidden is None:
-            hidden = outputs.last_hidden_state[:, 0]
-        return torch.nn.functional.normalize(hidden.float(), dim=-1)[0]
+            embeddings = model.encode_image(inputs, norm=True).float()
+        return torch.nn.functional.normalize(embeddings, dim=-1)
     except Exception as exc:
-        raise RuntimeError("Rad-DINO anatomical embedding inference failed") from exc
+        raise RuntimeError("MedImageInsight image embedding inference failed") from exc
 
 
-def compute_anatomical_embedding_similarity(
+def compute_medimageinsight_similarity(
     eval_image: Image.Image, ref_image: Image.Image
 ) -> float:
-    """Cosine similarity from frozen radiology-pretrained Rad-DINO embeddings."""
-    candidate = _image_embedding(eval_image)
-    reference = _image_embedding(ref_image)
-    return float(torch.clamp(torch.dot(candidate, reference), -1.0, 1.0).item())
+    """Cosine similarity between MedImageInsight image embeddings."""
+    embeddings = _medimageinsight_embeddings([eval_image, ref_image])
+    return float(torch.clamp(torch.sum(embeddings[0] * embeddings[1]), -1.0, 1.0).item())
 
 
-async def batch_async_anatomical_metrics(
+async def batch_async_medimageinsight_metrics(
     eval_images: List[Image.Image], ref_images: List[Image.Image]
 ) -> List[dict]:
     if len(eval_images) != len(ref_images):
         raise ValueError("eval_images and ref_images must have equal length")
-    return [
-        {"Anatomical_Embedding_Similarity": compute_anatomical_embedding_similarity(e, r)}
-        for e, r in zip(eval_images, ref_images)
-    ]
+    embeddings = _medimageinsight_embeddings(list(eval_images) + list(ref_images))
+    count = len(eval_images)
+    candidates = embeddings[:count]
+    references = embeddings[count:]
+    similarities = torch.sum(candidates * references, dim=-1).clamp(-1.0, 1.0).tolist()
+    return [{"MedImageInsight_Similarity": float(score)} for score in similarities]
+
+
+# Compatibility aliases for downstream callers.  They no longer load or
+# compute the former encoder; the returned key is deliberately the new metric name.
+def compute_anatomical_embedding_similarity(
+    eval_image: Image.Image, ref_image: Image.Image
+) -> float:
+    return compute_medimageinsight_similarity(eval_image, ref_image)
+
+
+batch_async_anatomical_metrics = batch_async_medimageinsight_metrics
 
 
 
 def evaluate_text_quality_thread_safe(eval_text: str, ref_text: str, eval_metric: str) -> float:
-    """
-    线程安全版本的文本质量评估函数。
-    
-    Args:
-        eval_text (str): 待评估的文本。
-        ref_text (str): 参考的基准文本。
-        eval_metric (str): 要使用的评估指标。支持 'bertscore', 'bleu'。
-
-    Returns:
-        float: 计算出的评估分数。
-    """
+    """Evaluate generated text against a reference using a thread-safe path."""
     metric = eval_metric.lower()
 
     if metric == 'bertscore':
-        # 使用线程锁保护 BERT 模型访问
+        # Serialize access to the BERT model.
         with bert_model_lock:
             try:
-                # bert-score 需要输入为列表
+                # bert-score expects lists.
                 preds = [eval_text]
                 refs = [ref_text]
 
@@ -417,57 +294,43 @@ def evaluate_text_quality_thread_safe(eval_text: str, ref_text: str, eval_metric
                     rescale_with_baseline=False,
                     num_layers=12,
                     device=_metric_device(),
-                    # device='cuda' if torch.cuda.is_available() else 'cpu',
-                    #batch_size=16,
-                    verbose=False  # 减少输出
+                    verbose=False,
                 )
                 
                 return f1.mean().item()
                 
             except Exception as e:
-                raise RuntimeError(f"BERTScore 计算失败: {e}") from e
+                raise RuntimeError(f"BERTScore calculation failed: {e}") from e
 
     elif metric == 'bleu':
         try:
             from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
         except ImportError as exc:
             raise RuntimeError("BLEU requested but nltk is not installed") from exc
-        # BLEU 分数需要将句子分割成词列表
-        reference = [ref_text.split()]  # 参考文本可以是多个，所以是列表的列表
-        candidate = eval_text.split()   # 预测文本只有一个
+        # BLEU expects a list of reference token lists and one candidate list.
+        reference = [ref_text.split()]
+        candidate = eval_text.split()
         
-        # 使用平滑函数计算 BLEU 分数，避免n-gram匹配为0导致分数为0
+        # Smooth BLEU to avoid a zero score from an unmatched n-gram.
         bleu_score = sentence_bleu(reference, candidate, smoothing_function=SmoothingFunction().method1)
         return bleu_score
 
     else:
         raise ValueError(
-            f"未知的文本评估指标: '{eval_metric}'. "
-            "支持的指标: 'bertscore', 'bleu'."
+            f"Unknown text evaluation metric: '{eval_metric}'. "
+            "Supported metrics: 'bertscore', 'bleu'."
         )
 
 
 
 
 def evaluate_text_quality(eval_text: str, ref_text: str, eval_metric: str) -> float:
-    """
-    评估生成文本相对于参考文本的质量（保持向后兼容）。
-    """
+    """Evaluate generated text against a reference while preserving compatibility."""
     return evaluate_text_quality_thread_safe(eval_text, ref_text, eval_metric)
 
 
 async def async_evaluate_text_quality(eval_text: str, ref_text: str, eval_metric: str) -> float:
-    """
-    异步版本的文本质量评估。
-    
-    Args:
-        eval_text (str): 待评估的文本。
-        ref_text (str): 参考的基准文本。
-        eval_metric (str): 要使用的评估指标。支持 'bertscore', 'bleu'。
-
-    Returns:
-        float: 计算出的评估分数。
-    """
+    """Asynchronously evaluate generated text against a reference."""
     metric = eval_metric.lower()
     
     if metric == 'bertscore':
@@ -480,53 +343,20 @@ async def async_evaluate_text_quality(eval_text: str, ref_text: str, eval_metric
         return evaluate_text_quality_thread_safe(eval_text, ref_text, eval_metric)
 
 
-# --- 批量异步处理函数 ---
-async def batch_async_FR_IQA(
-    eval_images: List[Image.Image], 
-    ref_images: List[Image.Image], 
-    eval_metric: str
-) -> List[float]:
-    """
-    批量异步处理图像质量评估。
-    
-    Args:
-        eval_images: 待评估图像列表
-        ref_images: 参考图像列表
-        eval_metric: 评估指标
-        
-    Returns:
-        List[float]: 评估分数列表
-    """
-    if len(eval_images) != len(ref_images):
-        raise ValueError("eval_images and ref_images must have equal length")
-    return [FR_IQA(candidate, reference, eval_metric)
-            for candidate, reference in zip(eval_images, ref_images)]
-
-
 async def batch_async_evaluate_text_quality(
     eval_texts: List[str], 
     ref_texts: List[str], 
     eval_metric: str
 ) -> List[float]:
-    """
-    批量异步处理文本质量评估。
-    
-    Args:
-        eval_texts: 待评估文本列表
-        ref_texts: 参考文本列表
-        eval_metric: 评估指标
-        
-    Returns:
-        List[float]: 评估分数列表
-    """
+    """Asynchronously evaluate batches of generated and reference text."""
     if len(eval_texts) != len(ref_texts):
-        raise ValueError("eval_texts 和 ref_texts 长度必须相同")
+        raise ValueError("eval_texts and ref_texts must have equal length")
     
-    # 对于 BERTScore，批量处理更高效，避免并发问题
+    # Batch BERTScore for efficiency and to avoid concurrency issues.
     if eval_metric.lower() == 'bertscore':
         return batch_bertscore_calculation(eval_texts, ref_texts)
     else:
-        # 对于 BLEU，可以并发处理
+        # BLEU evaluations can run concurrently.
         tasks = [
             async_evaluate_text_quality(eval_text, ref_text, eval_metric)
             for eval_text, ref_text in zip(eval_texts, ref_texts)
@@ -535,28 +365,44 @@ async def batch_async_evaluate_text_quality(
 
 
 def batch_bertscore_calculation(eval_texts: List[str], ref_texts: List[str]) -> List[float]:
-    """
-    批量计算 BERTScore，避免多线程冲突。
-    
-    Args:
-        eval_texts: 待评估文本列表
-        ref_texts: 参考文本列表
-        
-    Returns:
-        List[float]: BERTScore 列表
-    """
+    """Compute BERTScore in a batch without thread contention."""
     try:
         with bert_model_lock:
-            from bert_score import score as bert_score
+            global _bertscore_scorer, _bertscore_tokenizer, _bertscore_cache_key
+            # Use the immutable local snapshot when the runner provides one.
+            # This metric is evaluated repeatedly during long jobs; resolving a
+            # Hub model ID here can issue an online HEAD request on every batch
+            # even after all weights have been cached.  That makes a completed
+            # cache needlessly vulnerable to transient network/SSL failures.
+            model_ref = os.environ.get(
+                'MEDGEN_PUBMEDBERT_MODEL_PATH',
+                'microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract',
+            )
+            use_local_files_only = os.path.isdir(model_ref)
+            cache_key = (model_ref, str(_metric_device()))
+            if _bertscore_scorer is None or _bertscore_cache_key != cache_key:
+                from bert_score import BERTScorer
+                from transformers import AutoTokenizer
+                _bertscore_tokenizer = AutoTokenizer.from_pretrained(
+                    model_ref,
+                    local_files_only=use_local_files_only,
+                )
+                _bertscore_scorer = BERTScorer(
+                    model_type=model_ref,
+                    lang="en",
+                    rescale_with_baseline=False,
+                    num_layers=12,
+                    device=_metric_device(),
+                    batch_size=max(1, int(os.environ.get('MEDGEN_BERTSCORE_BATCH_SIZE', '64'))),
+                )
+                _bertscore_cache_key = cache_key
+
             # PubMedBERT has a hard 512-position limit.  Keep the clinical
             # entity/RadGraph metrics on the original full report, but make
             # the embedding metric well-defined for long generated reports.
             # Tokenization is done with the same tokenizer BERTScore uses so
             # truncation is by model tokens rather than arbitrary characters.
-            from transformers import AutoTokenizer
-            tokenizer = AutoTokenizer.from_pretrained(
-                "microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract"
-            )
+            tokenizer = _bertscore_tokenizer
 
             def truncate_for_bertscore(text: str) -> str:
                 encoded = tokenizer(
@@ -575,62 +421,56 @@ def batch_bertscore_calculation(eval_texts: List[str], ref_texts: List[str]) -> 
                 [truncate_for_bertscore(text) for text in eval_texts],
                 [truncate_for_bertscore(text) for text in ref_texts],
             )
-            _, _, f1_scores = bert_score(
+            _, _, f1_scores = _bertscore_scorer.score(
                 bertscore_texts[0],
                 bertscore_texts[1],
-                model_type="microsoft/BiomedNLP-PubMedBERT-base-uncased-abstract",
-                lang="en",
-                rescale_with_baseline=False,
-                num_layers=12,
-                device=_metric_device(),
-                #device='cuda' if torch.cuda.is_available() else 'cpu',
-                verbose=False
+                verbose=False,
+                batch_size=max(1, int(os.environ.get('MEDGEN_BERTSCORE_BATCH_SIZE', '64'))),
             )
             return f1_scores.tolist()
     except Exception as e:
-        raise RuntimeError(f"批量 BERTScore 计算失败: {e}") from e
+        raise RuntimeError(f"Batch BERTScore calculation failed: {e}") from e
 
 
-# --- 混合批量处理函数 ---
+# --- Mixed batch evaluation ---
 async def batch_mixed_evaluation(
     image_tasks: List[Tuple[Image.Image, Image.Image, str]] = None,
     text_tasks: List[Tuple[str, str, str]] = None
 ) -> Tuple[List[float], List[float]]:
-    """
-    同时处理图像和文本评估任务。
-    
+    """Evaluate image and text tasks together.
+
     Args:
-        image_tasks: 图像评估任务列表，每个元素为 (eval_image, ref_image, metric)
-        text_tasks: 文本评估任务列表，每个元素为 (eval_text, ref_text, metric)
-        
+        image_tasks: ``(evaluation_image, reference_image, metric)`` tuples.
+        text_tasks: ``(evaluation_text, reference_text, metric)`` tuples.
+
     Returns:
-        Tuple[List[float], List[float]]: (图像评估结果, 文本评估结果)
+        Image results followed by text results, returned as separate lists.
     """
     tasks = []
     
-    # 添加图像评估任务
+    # Add image-evaluation tasks.
     if image_tasks:
         for eval_img, ref_img, metric in image_tasks:
             tasks.append(async_FR_IQA(eval_img, ref_img, metric))
     
-    # 添加文本评估任务
+    # Add text-evaluation tasks.
     if text_tasks:
         for eval_text, ref_text, metric in text_tasks:
             tasks.append(async_evaluate_text_quality(eval_text, ref_text, metric))
     
-    # 并发执行所有任务
+    # Run all tasks concurrently.
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    # 处理异常并分离结果
+    # Replace failed tasks with the existing default score.
     processed_results = []
     for result in results:
         if isinstance(result, Exception):
-            print(f"任务执行出错: {result}")
-            processed_results.append(0.0)  # 默认值
+            print(f"Task execution failed: {result}")
+            processed_results.append(0.0)
         else:
             processed_results.append(result)
     
-    # 分离图像和文本结果
+    # Split image and text results.
     image_count = len(image_tasks) if image_tasks else 0
     image_results = processed_results[:image_count]
     text_results = processed_results[image_count:]
@@ -638,73 +478,73 @@ async def batch_mixed_evaluation(
     return image_results, text_results
 
 
-# --- 主函数入口和示例 ---
+# --- Demonstration entry points ---
 async def async_main():
-    """异步主函数示例"""
-    print("--- 异步图像质量评估 (FR-IQA) 示例 ---")
+    """Demonstrate asynchronous metric evaluation."""
+    print("--- Asynchronous full-reference image-quality evaluation ---")
     
-    # 创建示例图片
+    # Create example images.
     ref_img = Image.new('RGB', (256, 256), color='black')
     noise = np.random.randint(0, 50, (256, 256, 3), dtype=np.uint8)
     eval_img = Image.fromarray(np.array(ref_img) + noise)
     
-    # 单个异步评估
-    print("单个异步评估:")
+    # Evaluate one image pair asynchronously.
+    print("Single asynchronous evaluation:")
     lpips_task = async_FR_IQA(eval_img, ref_img, 'lpips')
     psnr_task = async_FR_IQA(eval_img, ref_img, 'psnr') 
     ssim_task = async_FR_IQA(eval_img, ref_img, 'ssim')
     
-    # 并发执行所有图像评估
+    # Run all image metrics concurrently.
     lpips_score, psnr_score, ssim_score = await asyncio.gather(
         lpips_task, psnr_task, ssim_task
     )
     
-    print(f"LPIPS Score: {lpips_score:.4f} (越低越好)")
-    print(f"PSNR Score: {psnr_score:.4f} dB (越高越好)")
-    print(f"SSIM Score: {ssim_score:.4f} (越接近1越好)")
+    print(f"LPIPS Score: {lpips_score:.4f} (lower is better)")
+    print(f"PSNR Score: {psnr_score:.4f} dB (higher is better)")
+    print(f"SSIM Score: {ssim_score:.4f} (closer to 1 is better)")
     
-    # 批量异步评估
-    print("\n批量异步评估:")
+    # Evaluate a batch asynchronously.
+    print("\nBatch asynchronous evaluation:")
     eval_images = [eval_img] * 3
     ref_images = [ref_img] * 3
     
     batch_scores = await batch_async_FR_IQA(eval_images, ref_images, 'ssim')
-    print(f"批量SSIM分数: {[f'{score:.4f}' for score in batch_scores]}")
+    print(f"Batch SSIM scores: {[f'{score:.4f}' for score in batch_scores]}")
     
     print("\n" + "="*40 + "\n")
     
-    # 异步文本评估示例
-    print("--- 异步文本质量评估示例 ---")
+    # Demonstrate asynchronous text evaluation.
+    print("--- Asynchronous text-quality evaluation ---")
     
     reference_text = "Normal stomach mucosa (negative for Helicobacter Pylori infection)"
     predicted_text_good = "The gastric mucosa appears normal with no evidence of H. pylori infection"
     predicted_text_bad = "computed tomography"
     
-    # 先尝试 BLEU 评估（不依赖网络）
-    print("BLEU 评估:")
+    # Start with BLEU, which does not require network access.
+    print("BLEU evaluation:")
     bleu_good_task = async_evaluate_text_quality(predicted_text_good, reference_text, 'bleu')
     bleu_bad_task = async_evaluate_text_quality(predicted_text_bad, reference_text, 'bleu')
     
     bleu_good, bleu_bad = await asyncio.gather(bleu_good_task, bleu_bad_task)
     
-    print(f"BLEU Score (Good Match): {bleu_good:.4f} (越接近1越好)")
-    print(f"BLEU Score (Bad Match): {bleu_bad:.4f} (越接近1越好)")
+    print(f"BLEU Score (Good Match): {bleu_good:.4f} (closer to 1 is better)")
+    print(f"BLEU Score (Bad Match): {bleu_bad:.4f} (closer to 1 is better)")
     
-    # 尝试 BERTScore 评估（可能受网络影响）
-    print("\nBERTScore 评估:")
+    # Try BERTScore, which can depend on model availability.
+    print("\nBERTScore evaluation:")
     try:
         bertscore_good_task = async_evaluate_text_quality(predicted_text_good, reference_text, 'bertscore')
         bertscore_bad_task = async_evaluate_text_quality(predicted_text_bad, reference_text, 'bertscore')
         
         bertscore_good, bertscore_bad = await asyncio.gather(bertscore_good_task, bertscore_bad_task)
         
-        print(f"BERTScore (Good Match): {bertscore_good:.4f} (越接近1越好)")
-        print(f"BERTScore (Bad Match): {bertscore_bad:.4f} (越接近1越好)")
+        print(f"BERTScore (Good Match): {bertscore_good:.4f} (closer to 1 is better)")
+        print(f"BERTScore (Bad Match): {bertscore_bad:.4f} (closer to 1 is better)")
     except Exception as e:
-        print(f"BERTScore 评估失败，可能是网络问题: {e}")
+        print(f"BERTScore evaluation failed; model access may be unavailable: {e}")
     
-    # 混合批量处理示例
-    print("\n--- 混合批量处理示例 ---")
+    # Demonstrate mixed batch evaluation.
+    print("\n--- Mixed batch evaluation ---")
     
     image_tasks = [
         (eval_img, ref_img, 'lpips'),
@@ -718,15 +558,15 @@ async def async_main():
     
     image_results, text_results = await batch_mixed_evaluation(image_tasks, text_tasks)
     
-    print(f"混合处理 - 图像结果: {[f'{score:.4f}' for score in image_results]}")
-    print(f"混合处理 - 文本结果: {[f'{score:.4f}' for score in text_results]}")
+    print(f"Mixed evaluation - image results: {[f'{score:.4f}' for score in image_results]}")
+    print(f"Mixed evaluation - text results: {[f'{score:.4f}' for score in text_results]}")
 
 
 def main():
-    """同步主函数 - 保持向后兼容"""
-    print("--- 同步版本 (原始实现) ---")
+    """Run the synchronous demonstration for backward compatibility."""
+    print("--- Synchronous evaluation ---")
     
-    # 原有的同步代码保持不变
+    # Create example images.
     ref_img = Image.new('RGB', (256, 256), color='black')
     noise = np.random.randint(0, 50, (256, 256, 3), dtype=np.uint8)
     eval_img = Image.fromarray(np.array(ref_img) + noise)
@@ -735,52 +575,52 @@ def main():
     psnr_score = FR_IQA(eval_img, ref_img, 'psnr')
     ssim_score = FR_IQA(eval_img, ref_img, 'ssim')
     
-    print(f"LPIPS Score: {lpips_score:.4f} (越低越好)")
-    print(f"PSNR Score: {psnr_score:.4f} dB (越高越好)")
-    print(f"SSIM Score: {ssim_score:.4f} (越接近1越好)")
+    print(f"LPIPS Score: {lpips_score:.4f} (lower is better)")
+    print(f"PSNR Score: {psnr_score:.4f} dB (higher is better)")
+    print(f"SSIM Score: {ssim_score:.4f} (closer to 1 is better)")
     
-    # 测试文本评估
-    print("\n文本评估 (BLEU):")
+    # Demonstrate text evaluation.
+    print("\nText evaluation (BLEU):")
     reference_text = "Normal stomach mucosa (negative for Helicobacter Pylori infection)"
     predicted_text_good = "The gastric mucosa appears normal with no evidence of H. pylori infection"
     
     bleu_score = evaluate_text_quality(predicted_text_good, reference_text, 'bleu')
-    print(f"BLEU Score: {bleu_score:.4f} (越接近1越好)")
+    print(f"BLEU Score: {bleu_score:.4f} (closer to 1 is better)")
     
     bert_score = evaluate_text_quality(predicted_text_good, reference_text, 'bertscore')
-    print(f"Bert Score: {bert_score:.4f} (越接近1越好)")
+    print(f"Bert Score: {bert_score:.4f} (closer to 1 is better)")
 
 
 
 if __name__ == '__main__':
     import time
         
-    print("选择运行模式:")
-    print("1. 同步版本 (原始)")
-    print("2. 异步版本 (新增)")
-    print("3. 性能对比")
+    print("Select a run mode:")
+    print("1. Synchronous evaluation")
+    print("2. Asynchronous evaluation")
+    print("3. Performance comparison")
     
-    choice = input("请输入选择 (1/2/3): ").strip()
+    choice = input("Enter a choice (1/2/3): ").strip()
     
     if choice == '1':
         main()
     elif choice == '2':
         asyncio.run(async_main())
     elif choice == '3':
-        print("--- 性能对比 ---")
+        print("--- Performance comparison ---")
         
-        # 创建测试数据
+        # Create test data.
         ref_img = Image.new('RGB', (256, 256), color='black')
         noise = np.random.randint(0, 50, (256, 256, 3), dtype=np.uint8)
         eval_img = Image.fromarray(np.array(ref_img) + noise)
         
-        # 同步版本测试
+        # Time synchronous evaluation.
         start_time = time.time()
         for _ in range(3):
             FR_IQA(eval_img, ref_img, 'ssim')
         sync_time = time.time() - start_time
         
-        # 异步版本测试
+        # Time asynchronous evaluation.
         async def async_test():
             tasks = [async_FR_IQA(eval_img, ref_img, 'ssim') for _ in range(3)]
             await asyncio.gather(*tasks)
@@ -789,9 +629,9 @@ if __name__ == '__main__':
         asyncio.run(async_test())
         async_time = time.time() - start_time
         
-        print(f"同步版本耗时: {sync_time:.4f}秒")
-        print(f"异步版本耗时: {async_time:.4f}秒")
-        print(f"性能提升: {((sync_time - async_time) / sync_time * 100):.1f}%")
+        print(f"Synchronous elapsed time: {sync_time:.4f} seconds")
+        print(f"Asynchronous elapsed time: {async_time:.4f} seconds")
+        print(f"Performance improvement: {((sync_time - async_time) / sync_time * 100):.1f}%")
     else:
-        print("无效选择，运行同步版本")
+        print("Invalid choice; running synchronous evaluation")
         main()

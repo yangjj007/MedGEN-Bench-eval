@@ -1,865 +1,600 @@
-import os
-import time
-import json
-import base64
-import mimetypes
+"""OpenAI-compatible vision-language model clients.
+
+The clients in this module work with hosted OpenAI-compatible gateways and
+local vLLM servers. They use one configuration format and one response shape.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from typing import Dict, Any, List, Optional, Tuple
-from io import BytesIO
-import random
-import requests
+import base64
+import functools
+import io
+import mimetypes
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any, Mapping, Optional, Sequence
+from urllib.parse import urlparse
 
 import yaml
-from openai import OpenAI, AsyncOpenAI
-
-# from util.text_render import add_text_to_image
+from openai import AsyncOpenAI, OpenAI
 from PIL import Image, ImageDraw, ImageFont
-import os
 
 
-from PIL import Image
-
-# def compress_image(image, max_size=800):
-#     if isinstance(image, str):
-#         image = Image.open(image)
-#     if max(image.size) > max_size:
-#         ratio = max_size / max(image.size)
-#         new_size = (int(image.width * ratio), int(image.height * ratio))
-#         image = image.resize(new_size)
-#     return image
+DEFAULT_CONFIG_PATH = "./api/config.yaml"
+_PLACEHOLDER_KEYS = {
+    "",
+    "YOUR_API_KEY",
+    "YOUR-API-KEY",
+    "sk-your-api-key-here",
+}
+_UNRESOLVED_ENV_PATTERN = re.compile(r"\$\{([^}]+)\}")
 
 
+def _expand_config_value(value: Any, field_name: str, config_path: str) -> Any:
+    """Expand shell-style environment variables in a YAML scalar."""
 
-def add_text_to_image(image_input, text, height_ratio=0.1, font_size=None):
-    """
-    在图片下方添加文字区域
-    
-    Args:
-        image_input: 图片路径(str)或PIL Image对象
-        text: 要添加的文字内容(str)
-        height_ratio: 扩展高度占原图高度的比例(float, 默认0.1即10%)
-        font_size: 字体大小(int, 如果为None则自动计算)
-    
-    Returns:
-        PIL Image对象: 添加文字后的图片
-    """
+    if not isinstance(value, str):
+        return value
+    expanded = os.path.expandvars(value).strip()
+    unresolved = _UNRESOLVED_ENV_PATTERN.findall(expanded)
+    if unresolved:
+        names = ", ".join(sorted(set(unresolved)))
+        raise ValueError(
+            f"Configuration field '{field_name}' in {config_path} references "
+            f"an unset environment variable: {names}. Set it before running."
+        )
+    return expanded
+
+
+def _read_config(config_path: str) -> dict[str, Any]:
+    path = Path(config_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"VLM configuration file does not exist: {path}. "
+            "Copy api/config.example.yaml to api/config.yaml or pass config_path."
+        )
     try:
-        # 处理输入，支持路径或Image对象
-        if isinstance(image_input, str):
-            if not os.path.exists(image_input):
-                raise FileNotFoundError(f"图片文件不存在: {image_input}")
-            original_image = Image.open(image_input)
-        elif isinstance(image_input, Image.Image):
-            original_image = image_input.copy()
-        else:
-            raise TypeError("输入必须是图片路径(str)或PIL Image对象")
-        
-        # 确保图片是RGB模式
-        if original_image.mode != 'RGB':
-            original_image = original_image.convert('RGB')
-        
-        # 获取原图尺寸
-        original_width, original_height = original_image.size
-        
-        # 计算扩展区域的高度
-        text_area_height = int(original_height * height_ratio)
-        
-        # 创建新图片（原图高度 + 文字区域高度）
-        new_height = original_height + text_area_height
-        new_image = Image.new('RGB', (original_width, new_height), 'white')
-        
-        # 将原图粘贴到新图片的上部
-        new_image.paste(original_image, (0, 0))
-        
-        # 创建绘图对象
-        draw = ImageDraw.Draw(new_image)
-        
-        # 尝试加载系统默认字体
+        config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ValueError(f"Invalid YAML in VLM configuration: {path}") from exc
+    if config is None:
+        return {}
+    if not isinstance(config, dict):
+        raise ValueError(f"VLM configuration must be a mapping: {path}")
+    return dict(config)
+
+
+def _is_local_url(base_url: str) -> bool:
+    host = (urlparse(base_url).hostname or "").lower()
+    return host in {"localhost", "127.0.0.1", "0.0.0.0", "::1"}
+
+
+def _coerce_positive_int(value: Any, name: str, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        result = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if result < 1:
+        raise ValueError(f"{name} must be at least one")
+    return result
+
+
+def _coerce_nonnegative_float(value: Any, name: str, default: float) -> float:
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if result < 0:
+        raise ValueError(f"{name} must not be negative")
+    return result
+
+
+async def _to_thread(function: Any, *args: Any) -> Any:
+    """Use asyncio.to_thread when available, with a Python 3.8 fallback."""
+
+    to_thread = getattr(asyncio, "to_thread", None)
+    if to_thread is not None:
+        return await to_thread(function, *args)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, functools.partial(function, *args))
+
+
+def _open_rgb_image(image_input: Any) -> Image.Image:
+    if isinstance(image_input, Image.Image):
+        return image_input.copy().convert("RGB")
+    if isinstance(image_input, (str, os.PathLike)):
+        path = Path(image_input)
+        if not path.is_file():
+            raise FileNotFoundError(f"Image file does not exist: {path}")
+        with Image.open(path) as image:
+            return image.convert("RGB")
+    if isinstance(image_input, (bytes, bytearray, memoryview)):
+        with Image.open(io.BytesIO(bytes(image_input))) as image:
+            return image.convert("RGB")
+    raise TypeError(
+        "image_input must be a path, a PIL Image, or raw image bytes; "
+        f"received {type(image_input).__name__}"
+    )
+
+
+def _load_font(size: int) -> ImageFont.ImageFont:
+    candidates = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+    )
+    for candidate in candidates:
         try:
-            # Windows系统
-            if os.name == 'nt':
-                font_path = "C:/Windows/Fonts/arial.ttf"
-            # macOS系统
-            elif os.uname().sysname == 'Darwin':
-                font_path = "/Library/Fonts/Arial.ttf"
-            # Linux系统
-            else:
-                font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
-            
-            # 如果没有指定字体大小，自动计算合适的大小
-            if font_size is None:
-                font_size = max(16, min(text_area_height // 2, original_width // len(text) if text else 20))
-            
-            font = ImageFont.truetype(font_path, font_size)
-        except (OSError, IOError):
-            # 如果无法加载TrueType字体，使用默认字体
-            font = ImageFont.load_default()
-            print("警告: 无法加载系统字体，使用默认字体")
-        
-        # 计算文字位置（居中显示）
-        if hasattr(draw, 'textbbox'):
-            # 新版本PIL
-            bbox = draw.textbbox((0, 0), text, font=font)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-        else:
-            # 兼容旧版本PIL
-            text_width, text_height = draw.textsize(text, font=font)
-        
-        # 计算文字的起始位置（水平和垂直居中）
-        x = (original_width - text_width) // 2
-        y = original_height + (text_area_height - text_height) // 2
-        
-        # 绘制文字（黑色）
-        draw.text((x, y), text, fill='black', font=font)
-        
-        return new_image
-    
-    except Exception as e:
-        print(f"⚠️ 跳过图片 {image_input}，原因: {e}")
-        return None
+            return ImageFont.truetype(candidate, size)
+        except OSError:
+            continue
+    return ImageFont.load_default()
 
 
-class double_image_vlm:
+def add_text_to_image(
+    image_input: Any,
+    text: str,
+    height_ratio: float = 0.1,
+    font_size: Optional[int] = None,
+) -> Image.Image:
+    """Return an RGB copy of an image with an optional label beneath it."""
+
+    image = _open_rgb_image(image_input)
+    label = str(text or "").strip()
+    if not label:
+        return image
+
+    try:
+        ratio = float(height_ratio)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("height_ratio must be numeric") from exc
+    if ratio <= 0:
+        raise ValueError("height_ratio must be positive")
+
+    label_height = max(28, int(image.height * ratio))
+    canvas = Image.new("RGB", (image.width, image.height + label_height), "white")
+    canvas.paste(image, (0, 0))
+    draw = ImageDraw.Draw(canvas)
+    chosen_size = font_size or max(14, min(label_height - 8, image.width // 18))
+    font = _load_font(chosen_size)
+    try:
+        bbox = draw.textbbox((0, 0), label, font=font)
+        label_width = bbox[2] - bbox[0]
+        label_text_height = bbox[3] - bbox[1]
+    except AttributeError:
+        label_width, label_text_height = draw.textsize(label, font=font)
+    x = max(0, (image.width - label_width) // 2)
+    y = image.height + max(0, (label_height - label_text_height) // 2)
+    draw.text((x, y), label, fill="black", font=font)
+    return canvas
+
+
+class _OpenAICompatibleVLM:
+    """Shared client implementation for single- and two-image requests."""
+
     def __init__(
         self,
-        config_path: str = "./api/config.yaml",
+        config_path: str = DEFAULT_CONFIG_PATH,
         model_name: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
-    ):
-        """
-        基于 AiHubMix 的 Qwen VL 客户端
-        - 读取配置文件
-        - 创建 OpenAI 客户端
-        - 支持重试、图片输入与文本输出解析
-        """
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+    ) -> None:
+        self.config_path = str(config_path)
+        self.config = _read_config(self.config_path)
 
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config: Dict[str, Any] = yaml.safe_load(f)
+        if base_url is not None:
+            selected_base_url = base_url
+        elif os.environ.get("MEDGEN_VLM_BASE_URL"):
+            selected_base_url = os.environ["MEDGEN_VLM_BASE_URL"]
+        else:
+            selected_base_url = _expand_config_value(
+                self.config.get("base_url", ""),
+                "base_url",
+                self.config_path,
+            )
+        self.base_url = str(selected_base_url or "").strip().rstrip("/")
+        if not self.base_url:
+            raise ValueError(
+                "A non-empty base_url is required. Set it in the YAML config, "
+                "pass base_url, or set MEDGEN_VLM_BASE_URL."
+            )
 
-        # 配置优先级: 显式参数 > 配置文件 > 默认
-        self.api_key = api_key or self.config.get("api_key") or ""
-        self.base_url = base_url or self.config.get("base_url") or "https://aihubmix.com/v1"
-        self.model_name = model_name or self.config.get("model_name") or "google/medgemma-1.5-4b-it"
-        self.temperature = self.config.get("temperature", 0.3)
+        if model_name is not None and str(model_name).strip():
+            selected_model = model_name
+        elif os.environ.get("MEDGEN_VLM_MODEL"):
+            selected_model = os.environ["MEDGEN_VLM_MODEL"]
+        else:
+            selected_model = _expand_config_value(
+                self.config.get("model_name", ""),
+                "model_name",
+                self.config_path,
+            )
+        self.model_name = str(selected_model or "").strip()
+        if not self.model_name:
+            raise ValueError(
+                "A non-empty model_name is required. Set it in the YAML config, "
+                "pass model_name, or set MEDGEN_VLM_MODEL."
+            )
 
-        self.max_retries = int(self.config.get("max_retries", 1))
-        self.retry_delay = float(self.config.get("retry_delay", 2))
+        if api_key is not None and str(api_key).strip():
+            selected_key = api_key
+        elif os.environ.get("MEDGEN_VLM_API_KEY"):
+            selected_key = os.environ["MEDGEN_VLM_API_KEY"]
+        else:
+            selected_key = _expand_config_value(
+                self.config.get("api_key", ""),
+                "api_key",
+                self.config_path,
+            ) or os.environ.get("OPENAI_API_KEY")
+        self.api_key = str(selected_key or "").strip()
+        if self.api_key in _PLACEHOLDER_KEYS:
+            if _is_local_url(self.base_url):
+                self.api_key = "EMPTY"
+            else:
+                raise ValueError(
+                    "A non-placeholder api_key is required for a non-local VLM endpoint. "
+                    "Set it in the YAML config, pass api_key, or export MEDGEN_VLM_API_KEY."
+                )
 
-        if not self.api_key:
-            raise ValueError("缺少 api_key；本地 vLLM 也必须在配置中填写非空占位值，例如 EMPTY")
+        self.temperature = float(self.config.get("temperature", 0.3))
+        self.max_retries = _coerce_positive_int(
+            self.config.get("max_retries"), "max_retries", 3
+        )
+        self.retry_delay = _coerce_nonnegative_float(
+            self.config.get("retry_delay"), "retry_delay", 1.0
+        )
+        self.request_timeout = _coerce_positive_int(
+            self.config.get("request_timeout", self.config.get("timeout")),
+            "request_timeout",
+            300,
+        )
+        response_format = self.config.get("response_format")
+        self.response_format = response_format if isinstance(response_format, Mapping) else None
 
-        # 站点信息（可选，用于统计/溯源）
-        self.site_url = self.config.get("site_url", "")
-        self.site_name = self.config.get("site_name", "")
-
-        # 同步和异步客户端
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-        self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
-
-        print(f"[{self.model_name}] 初始化完成，模型: {self.model_name}，网关: {self.base_url}")
+        self.site_url = str(self.config.get("site_url") or "").strip()
+        self.site_name = str(self.config.get("site_name") or "").strip()
+        self.client = OpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.request_timeout,
+        )
+        self.async_client = AsyncOpenAI(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            timeout=self.request_timeout,
+        )
 
     @staticmethod
-    def encode_image(image_input) -> str:
-        """将本地图片路径或图片对象编码为 base64 字符串
-        
-        Args:
-            image_input: 支持以下类型:
-                - str: 图片文件路径
-                - PIL.Image.Image: PIL图片对象
-                - bytes: 图片二进制数据
-                - numpy.ndarray: numpy图片数组
-        
-        Returns:
-            str: base64编码的图片字符串
-        """
-        
-        if isinstance(image_input, str):
-            if not os.path.exists(image_input):
-                raise FileNotFoundError(f"图片文件不存在: {image_input}")
-            with open(image_input, "rb") as f:
-                return base64.b64encode(f.read()).decode("utf-8")
-        elif isinstance(image_input, bytes):
-            return base64.b64encode(image_input).decode("utf-8")
-        elif hasattr(image_input, 'save') and hasattr(image_input, 'format'):
-            buffer = BytesIO()
-            format = image_input.format or 'PNG'
-            image_input.save(buffer, format=format)
-            return base64.b64encode(buffer.getvalue()).decode("utf-8")        
+    def guess_mime_type(image_path: str) -> str:
+        """Return a safe image MIME type for a local file path."""
+
+        mime, _ = mimetypes.guess_type(str(image_path))
+        return mime if mime and mime.startswith("image/") else "image/png"
+
+    @staticmethod
+    def encode_image(image_input: Any) -> str:
+        """Encode a local image, PIL image, or byte sequence as base64."""
+
+        if isinstance(image_input, (str, os.PathLike)):
+            path = Path(image_input)
+            if not path.is_file():
+                raise FileNotFoundError(f"Image file does not exist: {path}")
+            return base64.b64encode(path.read_bytes()).decode("ascii")
+        if isinstance(image_input, (bytes, bytearray, memoryview)):
+            return base64.b64encode(bytes(image_input)).decode("ascii")
+        if isinstance(image_input, Image.Image):
+            buffer = io.BytesIO()
+            image_input.convert("RGB").save(buffer, format="PNG")
+            return base64.b64encode(buffer.getvalue()).decode("ascii")
+        raise TypeError(
+            "image_input must be a path, a PIL Image, or raw image bytes; "
+            f"received {type(image_input).__name__}"
+        )
+
+    @classmethod
+    def _image_data_uri(cls, image_input: Any) -> str:
+        if isinstance(image_input, str) and image_input.startswith("data:image/"):
+            return image_input
+        mime = (
+            cls.guess_mime_type(str(image_input))
+            if isinstance(image_input, (str, os.PathLike))
+            else "image/png"
+        )
+        return f"data:{mime};base64,{cls.encode_image(image_input)}"
+
+    def _extra_headers(self) -> Optional[dict[str, str]]:
+        headers: dict[str, str] = {}
+        if self.site_url:
+            headers["HTTP-Referer"] = self.site_url
+        if self.site_name:
+            headers["X-Title"] = self.site_name
+        return headers or None
+
+    @staticmethod
+    def _field(value: Any, field_name: str, default: Any = None) -> Any:
+        if isinstance(value, Mapping):
+            return value.get(field_name, default)
+        return getattr(value, field_name, default)
+
+    @classmethod
+    def _parse_response(cls, response: Any) -> dict[str, Any]:
+        """Normalize OpenAI-compatible completion responses."""
+
+        choices = cls._field(response, "choices", []) or []
+        if not choices:
+            raise ValueError("VLM response has no choices")
+        message = cls._field(choices[0], "message")
+        if message is None:
+            raise ValueError("VLM response has no message")
+        content = cls._field(message, "content", "")
+
+        if isinstance(content, str):
+            text = content.strip()
+        elif isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+            text_parts: list[str] = []
+            for part in content:
+                if isinstance(part, str):
+                    text_parts.append(part)
+                    continue
+                part_type = cls._field(part, "type")
+                part_text = cls._field(part, "text")
+                if part_type in {None, "text", "output_text"} and part_text is not None:
+                    text_parts.append(str(part_text))
+            text = "".join(text_parts).strip()
         else:
-            raise TypeError(f"不支持的图片输入类型: {type(image_input)}")
+            text = "" if content is None else str(content).strip()
 
-    # async def generate_with_image_async(
-    #     self,
-    #     prompt: str,
-    #     input_image_path: str,
-    #     output_image_path: str,
-    #     input_image_lable: str = "Input",
-    #     output_image_lable: str = "Output",
-    #     temperature: Optional[float] = None,
-    #     max_tokens: Optional[int] = None,
-    # ) -> Dict[str, Any]:
-    #     temperature = temperature if temperature is not None else self.temperature
-    #     max_tokens = max_tokens or 4096
-        
-    #     input_image = add_text_to_image(input_image_path, input_image_lable)
-    #     output_image = add_text_to_image(output_image_path, output_image_lable)
+        usage_source = cls._field(response, "usage")
+        usage = {
+            key: cls._field(usage_source, key)
+            for key in ("prompt_tokens", "completion_tokens", "total_tokens")
+            if cls._field(usage_source, key) is not None
+        }
+        return {"text": text, "usage": usage, "raw": response}
 
-    #     input_img_base64 = self.encode_image(input_image)
-    #     output_img_base64 = self.encode_image(output_image)
-        
-    #     input_img_data_url = f"data:image/png;base64,{input_img_base64}"
-    #     output_img_data_url = f"data:image/png;base64,{output_img_base64}"
+    async def _complete(
+        self,
+        content: list[dict[str, Any]],
+        temperature: Optional[float],
+        max_tokens: Optional[int],
+    ) -> dict[str, Any]:
+        request_temperature = self.temperature if temperature is None else float(temperature)
+        request_max_tokens = (
+            int(max_tokens)
+            if max_tokens is not None
+            else int(os.environ.get("MEDGEN_JUDGE_MAX_TOKENS", "768"))
+        )
+        if request_max_tokens < 1:
+            raise ValueError("max_tokens must be at least one")
+        request_kwargs: dict[str, Any] = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": content}],
+            "temperature": request_temperature,
+            "max_tokens": request_max_tokens,
+            "stream": False,
+        }
+        headers = self._extra_headers()
+        if headers:
+            request_kwargs["extra_headers"] = headers
+        if self.response_format:
+            request_kwargs["response_format"] = dict(self.response_format)
 
-    #     messages = [
-    #         {
-    #             "role": "user",
-    #             "content": [
-    #                 {"type": "text", "text": prompt},
-    #                 {"type": "image_url", "image_url": {"url": input_img_data_url}},
-    #                 {"type": "image_url", "image_url": {"url": output_img_data_url}},
-    #             ],
-    #         }
-    #     ]
+        last_error: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                started = time.perf_counter()
+                response = await self.async_client.chat.completions.create(**request_kwargs)
+                result = self._parse_response(response)
+                result["_perf_http_seconds"] = time.perf_counter() - started
+                return result
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay * (2 ** (attempt - 1)))
+        assert last_error is not None
+        return {
+            "error": f"{type(last_error).__name__}: {last_error}",
+            "text": "",
+            "usage": {},
+        }
 
-    #     # 准备可选 headers
-    #     extra_headers = {}
-    #     if self.site_url:
-    #         extra_headers["HTTP-Referer"] = self.site_url
-    #     if self.site_name:
-    #         extra_headers["X-Title"] = self.site_name
+    async def aclose(self) -> None:
+        """Close the asynchronous HTTP client when the caller owns its lifetime."""
 
-    #     retries = 0
-    #     last_err = None
+        await self.async_client.close()
+        self.client.close()
 
-    #     while retries < self.max_retries:
-    #         try:
-    #             response = await self.async_client.chat.completions.create(
-    #                 model=self.model_name,
-    #                 messages=messages,
-    #                 temperature=temperature,
-    #                 max_tokens=max_tokens,
-    #                 stream=False,  # 不使用流式输出
-    #                 extra_headers=extra_headers if extra_headers else None,
-    #             )
 
-    #             return self._parse_response(response)
+class double_image_vlm(_OpenAICompatibleVLM):
+    """OpenAI-compatible VLM client for reference-aware image judging."""
 
-    #         except Exception as e:
-    #             retries += 1
-    #             last_err = e
-    #             print(f"[ERROR] 异步调用失败({retries}/{self.max_retries}): {e}")
-    #             if retries >= self.max_retries:
-    #                 break
-    #             await asyncio.sleep(self.retry_delay * (2 ** (retries - 1)))
-
-    #     return {"error": f"调用失败: {last_err}", "text": "", "usage": {}}
+    def _prepare_content_parts(
+        self,
+        prompt: str,
+        input_image_path: Any,
+        output_image_path: Any,
+        input_image_lable: str,
+        output_image_lable: str,
+    ) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = [{"type": "text", "text": str(prompt)}]
+        if input_image_path:
+            labeled_input = add_text_to_image(input_image_path, input_image_lable)
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._image_data_uri(labeled_input)},
+                }
+            )
+        if output_image_path:
+            labeled_output = add_text_to_image(output_image_path, output_image_lable)
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._image_data_uri(labeled_output)},
+                }
+            )
+        return content
 
     async def generate_with_image_async(
         self,
         prompt: str,
-        input_image_path: str = "",
-        output_image_path: str = "",
+        input_image_path: Any = "",
+        output_image_path: Any = "",
         input_image_lable: str = "Input",
         output_image_lable: str = "Output",
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        temperature = temperature if temperature is not None else self.temperature
-        max_tokens = max_tokens or 4096
+    ) -> dict[str, Any]:
+        """Submit a prompt with zero, one, or two labeled images."""
 
-        content_parts = [{"type": "text", "text": prompt}]
         try:
-        # 处理输入图像（如果提供）
-            if input_image_path.strip():
-                input_image = add_text_to_image(input_image_path, input_image_lable)
-                input_img_base64 = self.encode_image(input_image)
-                input_img_data_url = f"data:image/png;base64,{input_img_base64}"
-                content_parts.append({"type": "image_url", "image_url": {"url": input_img_data_url}})
-        except Exception as e:
-            print(f"⚠️ 跳过图片 {input_image_path}，原因: {e}")
+            prepare_started = time.perf_counter()
+            content = await _to_thread(
+                self._prepare_content_parts,
+                prompt,
+                input_image_path,
+                output_image_path,
+                input_image_lable,
+                output_image_lable,
+            )
+            result = await self._complete(content, temperature, max_tokens)
+            result["_perf_prepare_seconds"] = time.perf_counter() - prepare_started
+            return result
+        except Exception as exc:
+            return {
+                "error": f"{type(exc).__name__}: {exc}",
+                "text": "",
+                "usage": {},
+            }
 
-        # 处理输出图像（如果提供）
-        if output_image_path.strip():
-            output_image = add_text_to_image(output_image_path, output_image_lable)
-            output_img_base64 = self.encode_image(output_image)
-            output_img_data_url = f"data:image/png;base64,{output_img_base64}"
-            content_parts.append({"type": "image_url", "image_url": {"url": output_img_data_url}})
-
-        messages = [{"role": "user", "content": content_parts}]
-
-        # 准备可选 headers
-        extra_headers = {}
-        if self.site_url:
-            extra_headers["HTTP-Referer"] = self.site_url
-        if self.site_name:
-            extra_headers["X-Title"] = self.site_name
-
-        retries = 0
-        last_err = None
-
-        while retries < self.max_retries:
-            try:
-                response = await self.async_client.chat.completions.create(
-                    model=self.model_name,
-                    messages=messages,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    stream=False,
-                    extra_headers=extra_headers if extra_headers else None,
-                )
-                return self._parse_response(response)
-
-            except Exception as e:
-                retries += 1
-                last_err = e
-                print(f"[ERROR] 异步调用失败({retries}/{self.max_retries}): {e}")
-                if retries >= self.max_retries:
-                    break
-                await asyncio.sleep(self.retry_delay * (2 ** (retries - 1)))
-
-        return {"error": f"调用失败: {last_err}", "text": "", "usage": {}}
-
-    def _parse_response(self, response) -> Dict[str, Any]:
-        """解析响应的通用方法"""
-        # 解析文本内容
-        text_content = ""
-        
-        msg = response.choices[0].message
-        
-        # 从 content 中提取文本
-        if hasattr(msg, "content") and msg.content:
-            if isinstance(msg.content, str):
-                text_content = msg.content.strip()
-            elif isinstance(msg.content, list):
-                # 兼容某些返回结构
-                text_parts = []
-                for c in msg.content:
-                    if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
-                        text_parts.append(c["text"])
-                    elif isinstance(c, str):
-                        text_parts.append(c)
-                text_content = "".join(text_parts).strip()
-
-        # 解析 usage 信息
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            try:
-                usage = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(response.usage, "completion_tokens", None),
-                    "total_tokens": getattr(response.usage, "total_tokens", None),
-                }
-            except Exception:
-                usage = {}
-
-        print(f"[{self.model_name}] created: {getattr(response, 'created', '')}, usage: {usage}")
-
-        return {
-            "text": text_content,
-            "usage": usage,
-            "raw": response,
-        }
+    @staticmethod
+    def _normalize_request(request: Any) -> tuple[Any, Any, Any, str, str, Any, Any]:
+        if isinstance(request, Mapping):
+            return (
+                request.get("prompt", ""),
+                request.get("input_image_path", request.get("input_image", "")),
+                request.get("output_image_path", request.get("output_image", "")),
+                request.get("input_image_lable", request.get("input_image_label", "Input")),
+                request.get("output_image_lable", request.get("output_image_label", "Output")),
+                request.get("temperature"),
+                request.get("max_tokens"),
+            )
+        values = tuple(request)
+        if len(values) == 7:
+            return values  # type: ignore[return-value]
+        if len(values) == 4:
+            prompt, input_image_path, temperature, max_tokens = values
+            return prompt, input_image_path, "", "Input", "Output", temperature, max_tokens
+        if len(values) == 3:
+            prompt, input_image_path, output_image_path = values
+            return prompt, input_image_path, output_image_path, "Input", "Output", None, None
+        raise ValueError(
+            "A double-image request must be a mapping, a 7-item tuple, "
+            "or a legacy 3/4-item tuple"
+        )
 
     async def generate_batch(
         self,
-        requests: List[Tuple[str, str, str, Optional[str], Optional[str], Optional[float], Optional[int]]],
+        requests: Sequence[Any],
         concurrency: int = 8,
-    ) -> List[Dict[str, Any]]:
-        """
-        批量处理多个请求
-        
-        Args:
-            requests: List of (prompt, image_path, temperature, max_tokens)
-            concurrency: 并发数量
-            
-        Returns:
-            List of response dicts, 保持与输入相同的顺序
-        """
-        sem = asyncio.Semaphore(concurrency)
+    ) -> list[dict[str, Any]]:
+        """Run requests concurrently and preserve the input order."""
 
-        async def _process_one(idx: int, request_args: Tuple):
-            async with sem:
-                prompt, input_image_path, output_image_path, input_image_lable, output_image_lable, temperature, max_tokens = request_args
-                try:
-                    result = await self.generate_with_image_async(
-                        prompt=prompt,
-                        input_image_path=input_image_path,
-                        output_image_path=output_image_path,
-                        input_image_lable = input_image_lable,
-                        output_image_lable = output_image_lable,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                    )
+        limit = _coerce_positive_int(concurrency, "concurrency", 8)
+        semaphore = asyncio.Semaphore(limit)
 
-                except Exception as e:
-                    print(f"⚠️ 跳过图片 {input_image_path}，原因: {e}")
+        async def run_one(request: Any) -> dict[str, Any]:
+            try:
+                normalized = self._normalize_request(request)
+                async with semaphore:
+                    return await self.generate_with_image_async(*normalized)
+            except Exception as exc:
+                return {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "text": "",
+                    "usage": {},
+                }
 
-                return idx, result
-
-        # 创建所有异步任务
-        tasks = [
-            asyncio.create_task(_process_one(i, request))
-            for i, request in enumerate(requests)
-        ]
-
-        # 收集结果并保持顺序
-        results = [None] * len(tasks)
-        for coro in asyncio.as_completed(tasks):
-            idx, result = await coro
-            results[idx] = result
-
-        return results
+        return list(await asyncio.gather(*(run_one(request) for request in requests)))
 
 
-class single_image_vlm:
-    def __init__(
-        self,
-        config_path: str = "./api/config.yaml",
-        model_name: Optional[str] = None,
-        base_url: Optional[str] = None,
-        api_key: Optional[str] = None,
-    ):
-        """
-        基于 AiHubMix 的 Qwen VL 客户端
-        - 读取配置文件
-        - 创建 OpenAI 客户端
-        - 支持重试、图片输入与文本输出解析
-        """
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
-
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config: Dict[str, Any] = yaml.safe_load(f)
-
-        if model_name == "Ming-UniVision_VLM4gen" or model_name == "Ming-UniVision_VLM" or model_name == "HuatuoGPT-Vision" or model_name == "RadFM" or model_name == "Showo_VLM" or model_name == "Showo_VLM4EDIT" :
-            self.temperature = self.config.get("temperature", 0.3)
-
-            self.max_retries = int(self.config.get("max_retries", 3))
-            self.retry_delay = float(self.config.get("retry_delay", 2))
-
-            self.model_name = model_name
-
-            print(f"[{self.model_name}] 初始化完成，模型: {self.model_name}")
-
-        else:
-            # 配置优先级: 显式参数 > 配置文件 > 默认
-            self.api_key = api_key or self.config.get("api_key") or ""
-            self.base_url = base_url or self.config.get("base_url") or "https://aihubmix.com"
-            self.model_name = model_name or self.config.get("model_name") or (_ for _ in ()).throw(ValueError("❌ 未指定模型名称"))
-            self.temperature = self.config.get("temperature", 0.3)
-
-            self.max_retries = int(self.config.get("max_retries", 3))
-            self.retry_delay = float(self.config.get("retry_delay", 2))
-
-            if not self.api_key:
-                raise ValueError("缺少 api_key，请在 ./api/config.yaml 中设置 api_key")
-
-            # 站点信息（可选，用于统计/溯源）
-            self.site_url = self.config.get("site_url", "")
-            self.site_name = self.config.get("site_name", "")
-
-            # 同步和异步客户端
-            self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
-            self.async_client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
-
-            print(f"[{self.model_name}] 初始化完成，模型: {self.model_name}，网关: {self.base_url}")
-
-    @staticmethod
-    def encode_image(image_input) -> str:
-        """将本地图片路径或图片对象编码为 base64 字符串
-        
-        Args:
-            image_input: 支持以下类型:
-                - str: 图片文件路径
-                - PIL.Image.Image: PIL图片对象
-                - bytes: 图片二进制数据
-                - numpy.ndarray: numpy图片数组
-        
-        Returns:
-            str: base64编码的图片字符串
-        """
-        
-        # image_input = compress_image(image_input)
-
-        
-        if isinstance(image_input, str):
-            if not os.path.exists(image_input):
-                raise FileNotFoundError(f"图片文件不存在: {image_input}")
-            with open(image_input, "rb") as f:
-                return base64.b64encode(f.read()).decode("utf-8")
-        elif isinstance(image_input, bytes):
-            return base64.b64encode(image_input).decode("utf-8")
-        elif hasattr(image_input, 'save') and hasattr(image_input, 'format'):
-            buffer = BytesIO()
-            format = image_input.format or 'PNG'
-            image_input.save(buffer, format=format)
-            return base64.b64encode(buffer.getvalue()).decode("utf-8")        
-        else:
-            raise TypeError(f"不支持的图片输入类型: {type(image_input)}")
-
-    @staticmethod
-    def guess_mime_type(image_path: str) -> str:
-        """根据文件后缀猜测 MIME 类型，默认 image/png"""
-        mime, _ = mimetypes.guess_type(image_path)
-        if mime and mime.startswith('image/'):
-            return mime
-        return "image/png"
+class single_image_vlm(_OpenAICompatibleVLM):
+    """OpenAI-compatible VLM client for inference-time single-image prompts."""
 
     async def generate_with_image_async(
         self,
         prompt: str,
-        image_path: str,
+        image_path: Any,
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        if self.model_name == "Ming-UniVision_VLM4gen" or self.model_name == "Ming-UniVision_VLM" or self.model_name == "HuatuoGPT-Vision" or self.model_name == "RadFM" or self.model_name == "Showo_VLM" or self.model_name == "Showo_VLM4EDIT":
-            import requests, base64, types, json
+    ) -> dict[str, Any]:
+        """Submit a prompt and one image using an OpenAI image data URI."""
 
-            # 读取图片
-            with open(image_path, "rb") as f:
-                image_bytes = f.read()
-            input_image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-
-
-            if self.model_name == "Ming-UniVision_VLM4gen":
-                payload = {
-                    "model_name": f"{self.model_name}",
-                    "weight_version": "Ming-UniVision-16B-A3B",
-                    "mode": "understanding",
-                    "input_text": prompt,
-                    "input_image_base64": input_image_base64
-                }
-                
-                print(f"qqqqqqqqqqqqqqqq {payload['model_name']}")
-                
-                response = requests.post(
-                    "http://127.0.0.1:10093/api/run_model",
-                    data=payload,
-                    timeout=120
-                )
-
-            elif self.model_name == "Ming-UniVision_VLM":
-                payload = {
-                    "model_name": f"{self.model_name}",
-                    "weight_version": "Ming-UniVision-16B-A3B",
-                    "mode": "understanding",
-                    "input_text": prompt,
-                    "input_image_base64": input_image_base64
-                }
-                
-                print(f"qqqqqqqqqqqqqqqq {payload['model_name']}")
-                
-                response = requests.post(
-                    "http://127.0.0.1:10094/api/run_model",
-                    data=payload,
-                    timeout=60
-                )
-
-            elif self.model_name == "HuatuoGPT-Vision":
-                payload = {
-                    "model_name": f"{self.model_name}",
-                    "weight_version": "HuatuoGPT-Vision-7B",
-                    "mode": "VLM",
-                    "input_text": prompt,
-                    "input_image_base64": input_image_base64
-                }
-                
-                print(f"qqqqqqqqqqqqqqqq {payload['model_name']}")
-
-                response = requests.post(
-                    "http://127.0.0.1:10095/api/run_model",
-                    data=payload,
-                    timeout=60
-                )
-
-            elif self.model_name == "RadFM":
-                payload = {
-                    "model_name": f"{self.model_name}",
-                    "weight_version": "RadFM",
-                    "mode": "VLM",
-                    "input_text": prompt,
-                    "input_image_base64": input_image_base64
-                }
-                
-                print(f"qqqqqqqqqqqqqqqq {payload['model_name']}")
-
-                response = requests.post(
-                    "http://127.0.0.1:10096/api/run_model",
-                    data=payload,
-                    timeout=360
-                )
-
-            elif self.model_name == "Showo_VLM":
-                payload = {
-                    "model_name": f"{self.model_name}",
-                    "weight_version": "VLM",
-                    "mode": "VLM",
-                    "input_text": prompt,
-                    "input_image_base64": input_image_base64
-                }
-                
-                print(f"qqqqqqqqqqqqqqqq {payload['model_name']}")
-
-                response = requests.post(
-                    "http://127.0.0.1:10097/api/run_model",
-                    data=payload,
-                    timeout=360
-                )
-
-            elif self.model_name == "Showo_VLM4EDIT":
-                payload = {
-                    "model_name": f"{self.model_name}",
-                    "weight_version": "VLM",
-                    "mode": "VLM",
-                    "input_text": prompt,
-                    "input_image_base64": input_image_base64
-                }
-                
-                print(f"qqqqqqqqqqqqqqqq {payload['model_name']}")
-
-                response = requests.post(
-                    "http://127.0.0.1:10099/api/run_model",
-                    data=payload,
-                    timeout=360
-                ) 
-            
-            else:
-                raise ValueError(f"不支持的模型名称: {self.model_name}")
-            
-
-            result = response.json()
-
-            return self._parse_local_api_response(result)
-
-            # output_text = result.get("output_text", "")
-            # generate_prompt = result.get("input_text", "")
-
-            # # 返回的 text 必须是 JSON 字符串，和后续 extract_json 一致
-            # text_content = json.dumps({
-            #     "output_text": output_text,
-            #     "generate_prompt": generate_prompt
-            # }, ensure_ascii=False)
-
-            # # 构造伪 raw 对象
-            # msg = types.SimpleNamespace()
-            # msg.content = [{"type": "text", "text": text_content}]
-
-            # fake_response = types.SimpleNamespace()
-            # fake_response.choices = [types.SimpleNamespace(message=msg)]
-            # fake_response.usage = types.SimpleNamespace(
-            #     prompt_tokens=None,
-            #     completion_tokens=None,
-            #     total_tokens=None
-            # )
-            # fake_response.created = None
-
-            # return {
-            #     "text": text_content,  # JSON 字符串，包含 output_text 和 generate_prompt
-            #     "usage": {
-            #         "prompt_tokens": None,
-            #         "completion_tokens": None,
-            #         "total_tokens": None
-            #     },
-            #     "raw": fake_response
-            # }
-
-
-
-        else:
-            temperature = temperature if temperature is not None else self.temperature
-            max_tokens = max_tokens or 4096
-
-            base64_img = self.encode_image(image_path)
-            mime_type = self.guess_mime_type(image_path)
-            img_data_url = f"data:{mime_type};base64,{base64_img}"
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": img_data_url}},
-                    ],
-                }
+        try:
+            prepare_started = time.perf_counter()
+            image_uri = await _to_thread(self._image_data_uri, image_path)
+            content = [
+                {"type": "text", "text": str(prompt)},
+                {"type": "image_url", "image_url": {"url": image_uri}},
             ]
+            result = await self._complete(content, temperature, max_tokens)
+            result["_perf_prepare_seconds"] = time.perf_counter() - prepare_started
+            return result
+        except Exception as exc:
+            return {
+                "error": f"{type(exc).__name__}: {exc}",
+                "text": "",
+                "usage": {},
+            }
 
-            # 准备可选 headers
-            extra_headers = {}
-            if self.site_url:
-                extra_headers["HTTP-Referer"] = self.site_url
-            if self.site_name:
-                extra_headers["X-Title"] = self.site_name
-
-            retries = 0
-            last_err = None
-
-            while retries < self.max_retries:
-                try:
-                    response = await self.async_client.chat.completions.create(
-                        model=self.model_name,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        stream=False,  # 不使用流式输出
-                        extra_headers=extra_headers if extra_headers else None,
-                    )
-
-                    return self._parse_response(response)
-
-                except Exception as e:
-                    retries += 1
-                    last_err = e
-                    print(f"[ERROR] 异步调用失败({retries}/{self.max_retries}): {e}")
-                    if retries >= self.max_retries:
-                        break
-                    await asyncio.sleep(self.retry_delay * (2 ** (retries - 1)))
-                    # await asyncio.sleep(self.retry_delay * (2 ** (retries - 1)) + random.uniform(0, 0.5))
-
-
-            return {"error": f"调用失败: {last_err}", "text": "", "usage": {}}
-
-    # def _parse_local_api_response(self, response: dict) -> Dict[str, Any]:
-    #     text_content = response.get("output_text", "").strip()
-    #     return {
-    #         "text": text_content,
-    #         "raw": response
-    #     }
-
-    def _parse_local_api_response(self, response: dict) -> dict:
-        # 删除 input_image_base64 字段（如果存在）
-        response.pop("input_image_base64", None)
-
-        output = response.get("output_text", "")
-
-        if isinstance(output, list):
-            # 如果 output_text 是列表，则拼接为字符串
-            text_content = " ".join(str(x) for x in output).strip()
-        else:
-            # 如果是字符串，则直接 strip
-            text_content = str(output).strip()
-
-        return {
-            "text": text_content,
-            "raw": response
-        }
-
-
-
-    def _parse_response(self, response) -> Dict[str, Any]:
-        """解析响应的通用方法"""
-        # 解析文本内容
-        text_content = ""
-        
-        msg = response.choices[0].message
-
-        # 从 content 中提取文本
-        if hasattr(msg, "content") and msg.content:
-            if isinstance(msg.content, str):
-                text_content = msg.content.strip()
-            elif isinstance(msg.content, list):
-                # 兼容某些返回结构
-                text_parts = []
-                for c in msg.content:
-                    if isinstance(c, dict) and c.get("type") == "text" and c.get("text"):
-                        text_parts.append(c["text"])
-                    elif isinstance(c, str):
-                        text_parts.append(c)
-                text_content = "".join(text_parts).strip()
-
-        # 解析 usage 信息
-        usage = {}
-        if hasattr(response, "usage") and response.usage:
-            try:
-                usage = {
-                    "prompt_tokens": getattr(response.usage, "prompt_tokens", None),
-                    "completion_tokens": getattr(response.usage, "completion_tokens", None),
-                    "total_tokens": getattr(response.usage, "total_tokens", None),
-                }
-            except Exception:
-                usage = {}
-
-        print(f"[{self.model_name}] created: {getattr(response, 'created', '')}, usage: {usage}")
-        print(f"响应内容: {text_content}")
-        return {
-            "text": text_content,
-            "usage": usage,
-            "raw": response,
-        }
+    @staticmethod
+    def _normalize_request(request: Any) -> tuple[Any, Any, Any, Any]:
+        if isinstance(request, Mapping):
+            return (
+                request.get("prompt", ""),
+                request.get("image_path", request.get("input_image", "")),
+                request.get("temperature"),
+                request.get("max_tokens"),
+            )
+        values = tuple(request)
+        if len(values) == 4:
+            return values  # type: ignore[return-value]
+        if len(values) == 2:
+            prompt, image_path = values
+            return prompt, image_path, None, None
+        raise ValueError("A single-image request must be a mapping, 2-item, or 4-item tuple")
 
     async def generate_batch(
         self,
-        requests: List[Tuple[str, str, Optional[float], Optional[int]]],
+        requests: Sequence[Any],
         concurrency: int = 8,
-    ) -> List[Dict[str, Any]]:
-        """
-        批量处理多个请求
-        
-        Args:
-            requests: List of (prompt, image_path, temperature, max_tokens)
-            concurrency: 并发数量
-            
-        Returns:
-            List of response dicts, 保持与输入相同的顺序
-        """
-        sem = asyncio.Semaphore(concurrency)
+    ) -> list[dict[str, Any]]:
+        """Run single-image requests concurrently and preserve input ordering."""
 
-        async def _process_one(idx: int, request_args: Tuple):
-            async with sem:
-                prompt, image_path, temperature, max_tokens = request_args
-                result = await self.generate_with_image_async(
-                    prompt=prompt,
-                    image_path=image_path,
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                )
-                return idx, result
+        limit = _coerce_positive_int(concurrency, "concurrency", 8)
+        semaphore = asyncio.Semaphore(limit)
 
-        # 创建所有异步任务
-        tasks = [
-            asyncio.create_task(_process_one(i, request))
-            for i, request in enumerate(requests)
-        ]
+        async def run_one(request: Any) -> dict[str, Any]:
+            try:
+                normalized = self._normalize_request(request)
+                async with semaphore:
+                    return await self.generate_with_image_async(*normalized)
+            except Exception as exc:
+                return {
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "text": "",
+                    "usage": {},
+                }
 
-        # 收集结果并保持顺序
-        results = [None] * len(tasks)
-        for coro in asyncio.as_completed(tasks):
-            idx, result = await coro
-            results[idx] = result
-
-        return results
+        return list(await asyncio.gather(*(run_one(request) for request in requests)))
 
 
-
-async def demo_batch():
-    """
-    批量处理演示
-    """
-    client = single_image_vlm(config_path="./api/config.yaml",model_name="qwen3-vl-235b-a22b-instruct")
-    
-    # 准备批量请求
-    requests = [
-        ("请描述这张图片", "./output_image/0a41a27775c589d5.png", 0.7, 2048),
-        ("分析这张图片的内容", "./output_image/0afbfcc1994b2600.png", 0.8, 2048),
-        ("这张图片展示了什么？", "./output_image/0b0c027ecaffc52a.png", 0.6, 2048),
-    ]
-    
-    # 批量处理
-    results = await client.generate_batch(requests, concurrency=3)
-    
-    for i, result in enumerate(results):
-        print(f"\n--- 结果 {i+1} ---")
-        if "error" in result:
-            print(f"错误: {result['error']}")
-        else:
-            print(result["text"])
-            print(f"使用情况: {result['usage']}")
-
-
-if __name__ == "__main__":
-    
-    # 批量请求演示
-    asyncio.run(demo_batch())
+__all__ = ["add_text_to_image", "double_image_vlm", "single_image_vlm"]

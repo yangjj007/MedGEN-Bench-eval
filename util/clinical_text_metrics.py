@@ -4,7 +4,6 @@ import importlib
 import logging
 import os
 import re
-from collections import Counter
 from functools import lru_cache
 from typing import Any, Iterable
 
@@ -26,6 +25,7 @@ SECTION_ORDER = [
 
 OPTION_RE = re.compile(r"^\s*([A-Z])[\.)\]:-]\s*(.*)$")
 OPTION_LETTER_ONLY_RE = re.compile(r"^\s*([A-Z])\s*$")
+FINAL_ANSWER_RE = re.compile(r"(?:final\s+answer|answer|option|choice)\s*(?:is|:|=|-)?\s*\(?([A-Z])\)?(?:\.|\)|\s|$)", re.I)
 WORD_RE = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)?")
 SPACE_RE = re.compile(r"\s+")
 LOGGER = logging.getLogger(__name__)
@@ -81,47 +81,75 @@ def normalize_closed_form_answer(text: Any, choices: Iterable[str] | None = None
     return mappings.get(normalized, normalized)
 
 
-def compute_task_accuracy(
-    paper_task: str,
-    response: Any,
-    answer: Any,
-    choices: Iterable[str] | None = None,
-) -> float | None:
-    task = str(paper_task or "")
+def parse_closed_form_answer(text: Any, choices: Iterable[str] | None = None,
+                            task: str = "multiple-choice") -> dict[str, Any]:
+    """Extract a closed-form answer without treating reasoning as the answer.
+
+    ``NA`` is deliberately distinct from an incorrect answer.  For multiple
+    choice, the final option letter or an exact option body is accepted.  For
+    blank filling, the final labelled line (or short final line) is used.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return {"parse_status": "NA", "parsed_answer": None, "parse_failure_reason": "empty"}
+    task = str(task or "").lower()
     if task == "multiple-choice":
-        return float(
-            normalize_closed_form_answer(response, choices)
-            == normalize_closed_form_answer(answer, choices)
-        )
-    if task == "blank-filling":
-        return float(normalize_free_text(response) == normalize_free_text(answer))
-    return None
+        mappings = _choice_mappings(choices)
+        # Prefer an explicitly labelled final answer, scanning from the end so
+        # explanations containing option letters do not win.
+        for line in reversed([x.strip() for x in raw.splitlines() if x.strip()]):
+            m = FINAL_ANSWER_RE.search(line)
+            if m:
+                value = mappings.get(m.group(1).lower(), m.group(1).lower())
+                return {"parse_status": "parsed", "parsed_answer": value, "parse_failure_reason": None}
+            value = normalize_closed_form_answer(line, choices)
+            if value in mappings:
+                return {"parse_status": "parsed", "parsed_answer": value, "parse_failure_reason": None}
+        # A standalone option token anywhere is safe only when it is the
+        # complete final sentence.
+        for m in reversed(list(re.finditer(r"\b([A-Z])\b", raw.upper()))):
+            letter = m.group(1).lower()
+            if letter in mappings:
+                return {"parse_status": "parsed", "parsed_answer": mappings[letter], "parse_failure_reason": None}
+        # Match an option body as a phrase, longest first.
+        for key in sorted((k for k in mappings if len(k) > 1), key=len, reverse=True):
+            if normalize_free_text(key) in normalize_free_text(raw):
+                return {"parse_status": "parsed", "parsed_answer": mappings[key], "parse_failure_reason": None}
+        return {"parse_status": "NA", "parsed_answer": None, "parse_failure_reason": "no_option_detected"}
+    # Blank filling: remove a final-answer prefix and punctuation, then keep a
+    # concise final phrase rather than the preceding chain-of-thought.
+    lines = [x.strip() for x in raw.splitlines() if x.strip()]
+    candidate = lines[-1] if lines else raw
+    candidate = re.sub(r"^(?:(?:final\s+)?(?:answer|response|blank)|the\s+blank)\s*(?:is|:|=|-)?\s*", "", candidate, flags=re.I)
+    candidate = re.sub(r"^[\s\[\]().,:;-]+|[\s\[\]().,:;-]+$", "", candidate)
+    if not candidate or len(candidate.split()) > 20:
+        return {"parse_status": "NA", "parsed_answer": None, "parse_failure_reason": "no_short_answer"}
+    return {"parse_status": "parsed", "parsed_answer": normalize_free_text(candidate), "parse_failure_reason": None}
+
+
+def compute_closed_form_exact_match(response: Any, answer: Any,
+                                   choices: Iterable[str] | None = None,
+                                   task: str = "multiple-choice") -> dict[str, Any]:
+    expected = parse_closed_form_answer(answer, choices, task)
+    observed = parse_closed_form_answer(response, choices, task)
+    if observed["parse_status"] != "parsed" or expected["parse_status"] != "parsed":
+        return {"score": None, "parse_status": observed["parse_status"],
+                "parsed_answer": observed["parsed_answer"],
+                "expected_answer": expected["parsed_answer"],
+                "parse_failure_reason": observed["parse_failure_reason"] or "reference_unparsed"}
+    return {"score": float(observed["parsed_answer"] == expected["parsed_answer"]),
+            "parse_status": "parsed", "parsed_answer": observed["parsed_answer"],
+            "expected_answer": expected["parsed_answer"], "parse_failure_reason": None}
 
 
 def _tokenize(text: Any) -> list[str]:
     return WORD_RE.findall(_normalize_text_for_tokens(text))
 
 
-def compute_text_em_f1(response: Any, answer: Any) -> tuple[float, float]:
+def compute_text_exact_match(response: Any, answer: Any) -> float:
     norm_response = normalize_free_text(response)
     norm_answer = normalize_free_text(answer)
-    em = float(norm_response == norm_answer)
-
-    response_tokens = _tokenize(response)
-    answer_tokens = _tokenize(answer)
-    if not response_tokens and not answer_tokens:
-        return em, 1.0
-    if not response_tokens or not answer_tokens:
-        return em, 0.0
-
-    common = Counter(response_tokens) & Counter(answer_tokens)
-    overlap = sum(common.values())
-    if overlap == 0:
-        return em, 0.0
-    precision = overlap / len(response_tokens)
-    recall = overlap / len(answer_tokens)
-    f1 = 2 * precision * recall / (precision + recall)
-    return em, f1
+    return float(norm_response == norm_answer)
 
 
 def _serialize_dict_section(key: str, value: Any, lines: list[str], indent: int = 0) -> None:
@@ -166,145 +194,6 @@ def serialize_clinical_reference(answer: Any) -> str:
     return "\n".join(lines)
 
 
-ENTITY_PATTERNS: dict[str, tuple[str, ...]] = {
-    "lungs": ("lung", "lungs", "pulmonary"),
-    "heart": ("heart", "cardiac", "cardiomediastinal silhouette"),
-    "mediastinum": ("mediastinum", "mediastinal contour", "cardiomediastinal silhouette"),
-    "pleura": ("pleura", "pleural"),
-    "pleural effusion": ("pleural effusion", "effusion"),
-    "pneumothorax": ("pneumothorax",),
-    "atelectasis": ("atelectasis",),
-    "consolidation": ("consolidation",),
-    "opacity": ("opacity", "opacification", "opacities"),
-    "edema": ("edema",),
-    "mass": ("mass",),
-    "nodule": ("nodule", "nodules"),
-    "lesion": ("lesion", "lesions"),
-    "cyst": ("cyst", "cysts"),
-    "fracture": ("fracture", "fractures"),
-    "pancreas": ("pancreas", "pancreatic"),
-    "parathyroid": ("parathyroid",),
-    "thyroid": ("thyroid",),
-    "kidney": ("kidney", "kidneys", "renal"),
-    "diaphragm": ("diaphragm", "hemidiaphragm"),
-    "endotracheal tube": ("endotracheal tube",),
-    "enteric tube": ("enteric tube",),
-    "chest tube": ("chest tube",),
-    "catheter": ("catheter",),
-    "radiograph": ("radiograph", "x-ray", "xray"),
-    "ct": ("ct", "computed tomography"),
-    "mri": ("mri", "magnetic resonance imaging"),
-    "ultrasound": ("ultrasound", "doppler", "sonography"),
-}
-
-
-def extract_clinical_entities(text: Any) -> set[str]:
-    norm = _normalize_text_for_tokens(text)
-    entities: set[str] = set()
-    for canonical, patterns in ENTITY_PATTERNS.items():
-        if any(re.search(r"(?<![a-z])" + re.escape(pattern) + r"(?![a-z])", norm) for pattern in patterns):
-            entities.add(canonical)
-    return entities
-
-
-def compute_clinical_entity_metrics(response: Any, reference: Any) -> dict[str, Any]:
-    response_entities = extract_clinical_entities(response)
-    reference_entities = extract_clinical_entities(reference)
-    if not response_entities and not reference_entities:
-        return {
-            "precision": 1.0,
-            "recall": 1.0,
-            "f1": 1.0,
-            "response_entities": sorted(response_entities),
-            "reference_entities": sorted(reference_entities),
-        }
-    if not response_entities or not reference_entities:
-        return {
-            "precision": 0.0 if not response_entities else 0.0,
-            "recall": 0.0,
-            "f1": 0.0,
-            "response_entities": sorted(response_entities),
-            "reference_entities": sorted(reference_entities),
-        }
-    overlap = len(response_entities & reference_entities)
-    precision = overlap / len(response_entities) if response_entities else 0.0
-    recall = overlap / len(reference_entities) if reference_entities else 0.0
-    f1 = 0.0 if (precision + recall) == 0 else 2 * precision * recall / (precision + recall)
-    return {
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "response_entities": sorted(response_entities),
-        "reference_entities": sorted(reference_entities),
-    }
-
-
-def compute_entity_error_metrics(response: Any, reference: Any) -> dict[str, Any]:
-    """实体级错误分类：幻觉（响应实体不在参考中）、遗漏（参考实体缺失）、事实精确率。
-
-    - hallucination_rate: |响应实体 \\ 参考实体| / |响应实体|（0 表示没有虚构实体）。
-    - omission_rate:      |参考实体 \\ 响应实体| / |参考实体|（0 表示没有遗漏）。
-    - factual_precision:  |响应 ∩ 参考| / |响应|（与实体 precision 一致，供报告生成任务使用）。
-    """
-    response_entities = extract_clinical_entities(response)
-    reference_entities = extract_clinical_entities(reference)
-    if not response_entities and not reference_entities:
-        return {
-            "hallucination_rate": 0.0,
-            "omission_rate": 0.0,
-            "factual_precision": 1.0,
-            "hallucinated_entities": [],
-            "omitted_entities": [],
-        }
-    hallucinated = response_entities - reference_entities
-    omitted = reference_entities - response_entities
-    return {
-        "hallucination_rate": (
-            len(hallucinated) / len(response_entities) if response_entities else 0.0
-        ),
-        "omission_rate": (
-            len(omitted) / len(reference_entities) if reference_entities else 0.0
-        ),
-        "factual_precision": (
-            len(response_entities & reference_entities) / len(response_entities)
-            if response_entities
-            else 0.0
-        ),
-        "hallucinated_entities": sorted(hallucinated),
-        "omitted_entities": sorted(omitted),
-    }
-
-
-def compute_factual_precision_chexbert(response: Any, reference: Any) -> float | None:
-    """可选 CheXbert 风格事实校验（默认关闭）。
-
-    仅当环境变量 MEDGEN_ENABLE_CHEXBERT=1 且可导入配置的模块时才启用。
-    模块需暴露 ``factual_precision(response, reference) -> float``；缺失或调用
-    失败时返回 None，调用方跳过该指标（避免把可选能力变成硬依赖）。
-    """
-    if os.environ.get("MEDGEN_ENABLE_CHEXBERT", "").strip() != "1":
-        return None
-    module_name = os.environ.get("MEDGEN_CHEXBERT_MODULE", "chexbert").strip()
-    try:
-        chexbert_module = importlib.import_module(module_name)
-    except ImportError:
-        LOGGER.warning(
-            "MEDGEN_ENABLE_CHEXBERT=1 但无法导入模块 %r，跳过 CheXbert 事实校验。",
-            module_name,
-        )
-        return None
-    scorer = getattr(chexbert_module, "factual_precision", None)
-    if scorer is None:
-        LOGGER.warning("模块 %r 未暴露 factual_precision，跳过 CheXbert 事实校验。", module_name)
-        return None
-    try:
-        score = scorer(_collapse_spaces(str(response or "")), serialize_clinical_reference(reference))
-        return float(score)
-    except Exception as exc:  # pragma: no cover - defensive third-party fallback
-        LOGGER.warning("CheXbert 事实校验调用失败，跳过：%s", exc)
-        return None
-
-
 def _radgraph_model_type() -> str:
     return os.environ.get("MEDGEN_RADGRAPH_MODEL_TYPE", "radgraph-xl")
 
@@ -323,6 +212,11 @@ def _radgraph_cuda_device() -> int | None:
     except ValueError:
         LOGGER.warning("Ignoring invalid MEDGEN_RADGRAPH_CUDA=%r; expected an integer GPU id.", raw_value)
         return None
+
+
+def _radgraph_tokenizer_cache_dir() -> str | None:
+    cache_dir = os.environ.get("MEDGEN_RADGRAPH_TOKENIZER_CACHE_DIR", "").strip()
+    return cache_dir or None
 
 
 @lru_cache(maxsize=1)
@@ -347,6 +241,10 @@ def _get_radgraph_f1_scorer():
     cuda_device = _radgraph_cuda_device()
     if cuda_device is not None:
         scorer_kwargs["cuda"] = cuda_device
+
+    tokenizer_cache_dir = _radgraph_tokenizer_cache_dir()
+    if tokenizer_cache_dir:
+        scorer_kwargs["tokenizer_cache_dir"] = tokenizer_cache_dir
 
     return scorer_cls(**scorer_kwargs)
 
@@ -403,3 +301,73 @@ def compute_radgraph_f1(response: Any, reference: Any) -> dict[str, Any]:
         return {"applicable": False, "f1": None, "backend": "skipped"}
 
     return _compute_radgraph_f1_with_package(response_text, reference_text)
+
+
+def compute_radgraph_f1_batch(
+    responses: list[Any], references: list[Any]
+) -> list[dict[str, Any]]:
+    """Compute per-sample RG_ER scores with one RadGraph model call.
+
+    ``F1RadGraph`` natively accepts lists, but the historical evaluator called
+    it once per record.  Batching keeps exactly the same RG_ER reward while
+    avoiding repeated tokenizer/model launches between records.
+    """
+    if len(responses) != len(references):
+        raise ValueError("responses and references must have equal length")
+
+    # Preserve the fail-loud behavior even when every item is too short for a
+    # meaningful entity graph.
+    scorer = _get_radgraph_f1_scorer()
+    results = [
+        {"applicable": False, "f1": None, "backend": "skipped"}
+        for _ in responses
+    ]
+    eligible_indices: list[int] = []
+    eligible_hyps: list[str] = []
+    eligible_refs: list[str] = []
+    for index, (response, reference) in enumerate(zip(responses, references)):
+        response_text = _collapse_spaces(str(response or ""))
+        reference_text = serialize_clinical_reference(reference)
+        if len(_tokenize(reference_text)) < 4 or len(_tokenize(response_text)) < 4:
+            continue
+        eligible_indices.append(index)
+        eligible_hyps.append(response_text)
+        eligible_refs.append(reference_text)
+
+    if not eligible_indices:
+        return results
+
+    try:
+        _, reward_list, hypothesis_annotations, reference_annotations = scorer(
+            hyps=eligible_hyps,
+            refs=eligible_refs,
+        )
+    except Exception as exc:  # pragma: no cover - third-party inference
+        raise RuntimeError("RadGraph scorer failed during batched inference") from exc
+
+    if not isinstance(reward_list, (list, tuple)) or len(reward_list) < 2:
+        raise RuntimeError("RadGraph scorer returned an invalid reward structure")
+    rg_er_scores = reward_list[1]
+    if not (
+        len(rg_er_scores) == len(eligible_indices)
+        and len(hypothesis_annotations) == len(eligible_indices)
+        and len(reference_annotations) == len(eligible_indices)
+    ):
+        raise RuntimeError("RadGraph scorer returned an unexpected batch length")
+
+    for local_index, original_index in enumerate(eligible_indices):
+        hypothesis_annotation = hypothesis_annotations[local_index]
+        reference_annotation = reference_annotations[local_index]
+        if not _annotation_has_entities(hypothesis_annotation) and not _annotation_has_entities(reference_annotation):
+            results[original_index] = {
+                "applicable": False,
+                "f1": None,
+                "backend": "radgraph",
+            }
+            continue
+        results[original_index] = {
+            "applicable": True,
+            "f1": float(rg_er_scores[local_index]),
+            "backend": "radgraph",
+        }
+    return results

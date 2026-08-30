@@ -1,14 +1,10 @@
 from __future__ import annotations
 
-# todo:下面代码的断点保存只保存了vlm judge的部分，而没有保存图片和文本metric，帮我加上
-
-# 告诉我需要修改的函数完整实现
-
-
 import argparse
 import json
 import os
 import asyncio
+import time
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
@@ -24,12 +20,10 @@ from util.format_parser import extract_json
 from util.clinical_text_metrics import (
     serialize_clinical_reference,
     normalize_closed_form_answer,
-    compute_task_accuracy,
-    compute_text_em_f1,
-    compute_clinical_entity_metrics,
+    compute_closed_form_exact_match,
+    compute_text_exact_match,
     compute_radgraph_f1,
-    compute_entity_error_metrics,
-    compute_factual_precision_chexbert,
+    compute_radgraph_f1_batch,
 )
 
 # Dataset/eval-input validation should not require model clients or heavyweight
@@ -39,30 +33,44 @@ try:
     from util.metrics import (
         batch_async_evaluate_text_quality,
         batch_async_FR_IQA,
-        batch_async_anatomical_metrics,
+        batch_async_medimageinsight_metrics,
     )
     from api.get_vlm_res import double_image_vlm
 except ModuleNotFoundError as exc:
     EVAL_DEPENDENCY_ERROR = exc
     batch_async_evaluate_text_quality = None
     batch_async_FR_IQA = None
-    batch_async_anatomical_metrics = None
+    batch_async_medimageinsight_metrics = None
     double_image_vlm = None
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+if os.environ.get('MEDGEN_QUIET_HTTP', '0') == '1':
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('openai').setLevel(logging.WARNING)
 
 METRIC_THRESHOLDS = {
-    'Anatomical_Embedding_Similarity': {'lower_is_better': False, 'threshold': 0.7},
+    'MedImageInsight_Similarity': {'lower_is_better': False, 'threshold': 0.7},
     'LPIPS': {'lower_is_better': True, 'threshold': 0.6},
     'PSNR': {'lower_is_better': False, 'threshold': 28.0},
     'SSIM': {'lower_is_better': False, 'threshold': 0.7},
     'BLEU': {'lower_is_better': False, 'threshold': 0.09},
     'BERT_Score': {'lower_is_better': False, 'threshold': 0.9},
-    'Entity_Hallucination_Rate': {'lower_is_better': True, 'threshold': 0.1},
-    'Entity_Omission_Rate': {'lower_is_better': True, 'threshold': 0.1},
-    'Entity_Factual_Precision': {'lower_is_better': False, 'threshold': 0.9},
     'VLM_Overall_Score_WO_GT': {'lower_is_better': False, 'threshold': 8.0},
     'VLM_Overall_Score_W_GT': {'lower_is_better': False, 'threshold': 8.0},
+}
+
+LOCAL_METRICS_VERSION = 'medimageinsight-radgraph-v3'
+
+# Exact string matching is a transparent record for closed-form VQA answers,
+# not a proxy for factual quality in free-text reports or descriptions.
+CLOSED_FORM_TEXT_EM_TASKS = {'multiple-choice', 'blank-filling'}
+
+JUDGE_DIMENSIONS = {
+    'anatomical_accuracy': 'VLM_Anatomical_Accuracy',
+    'clinical_finding_accuracy': 'VLM_Clinical_Finding_Accuracy',
+    'instruction_compliance': 'VLM_Instruction_Compliance',
+    'cross_modal_consistency': 'VLM_Cross_Modal_Consistency',
+    'hallucination_omission_control': 'VLM_Hallucination_Omission_Control',
 }
 
 # The canonical Table IV view contains exactly these 16 paper tasks.  Keep the
@@ -125,18 +133,18 @@ def validate_paper_task(value: object) -> str:
     task_name = normalize_paper_task(value)
     if task_name not in SUPPORTED_PAPER_TASKS:
         raise ValueError(
-            f"未知 paper_task={value!r}; 期望 Table IV 的 16 个任务之一: "
+            f"Unknown paper_task={value!r}; expected one of the 16 Table IV tasks: "
             + ', '.join(sorted(SUPPORTED_PAPER_TASKS))
         )
     return task_name
 
-# Bootstrap 重采样次数（可通过环境变量覆盖，仅用于统计模块）。
+# Bootstrap resampling count (overridable via environment variable; used only for statistics).
 BOOTSTRAP_SAMPLES = max(100, int(os.environ.get('MEDGEN_BOOTSTRAP_SAMPLES', '1000')))
 
 def load_jsonl_data(jsonl_path: str) -> list:
-    """从jsonl文件中加载数据"""
+    """Load data from a JSONL file"""
     if not os.path.exists(jsonl_path):
-        logging.error(f"文件未找到: {jsonl_path}")
+        logging.error(f"File not found: {jsonl_path}")
         return []
     with open(jsonl_path, 'r', encoding='utf-8') as f:
         return [json.loads(line) for line in f]
@@ -194,7 +202,7 @@ def validate_eval_input(data: list, task: str, data_path: str) -> dict:
 
     if errors:
         raise ValueError(
-            f"评测输入验证失败，共 {len(errors)} 个错误:\n" + "\n".join(errors[:50])
+            f"Evaluation input validation failed with {len(errors)} error(s):\n" + "\n".join(errors[:50])
         )
     present_tasks = set(task_counts)
     missing_tasks = sorted(SUPPORTED_PAPER_TASKS - present_tasks)
@@ -231,7 +239,7 @@ def task_coverage(data: list) -> dict:
 
 
 def calculate_accuracy_rates(results: dict) -> dict:
-    """根据预设阈值计算各项指标的通过率"""
+    """Calculate per-metric pass rates using predefined thresholds."""
     accuracy_rates = {}
     for metric, values in results.items():
         if metric in METRIC_THRESHOLDS and isinstance(values, list) and values:
@@ -300,7 +308,7 @@ def canonical_response_text(item: dict) -> str:
     return " ".join(response.strip().split())
 
 
-def compute_text_metric_bundle(item: dict) -> dict:
+def _text_metric_bundle_without_radgraph(item: dict) -> dict:
     response_text = canonical_response_text(item)
     answer_text = canonical_answer_text(item)
     paper_task = validate_paper_task(paper_task_for_item(item))
@@ -310,37 +318,50 @@ def compute_text_metric_bundle(item: dict) -> dict:
         'normalized_answer_text': answer_text,
     }
 
-    task_accuracy = compute_task_accuracy(
-        paper_task=paper_task,
-        response=item.get('response', ''),
-        answer=item.get('answer', ''),
-        choices=item.get('choice') or [],
+    if paper_task in CLOSED_FORM_TEXT_EM_TASKS:
+        closed = compute_closed_form_exact_match(item.get('response', ''), item.get('answer', ''), item.get('choice') or [], paper_task)
+        metrics['Text_EM'] = closed['score']
+        metrics['Text_EM_parse_status'] = closed['parse_status']
+        metrics['Text_EM_parsed_answer'] = closed['parsed_answer']
+        metrics['Text_EM_expected_answer'] = closed['expected_answer']
+        metrics['Text_EM_parse_failure_reason'] = closed['parse_failure_reason']
+
+    return metrics
+
+
+def compute_text_metric_bundle(item: dict) -> dict:
+    metrics = _text_metric_bundle_without_radgraph(item)
+    radgraph = compute_radgraph_f1(
+        metrics['normalized_response_text'], metrics['normalized_answer_text']
     )
-    if task_accuracy is not None:
-        metrics['Task_Accuracy'] = task_accuracy
-
-    text_em, text_f1 = compute_text_em_f1(response_text, answer_text)
-    metrics['Text_EM'] = text_em
-    metrics['Text_F1'] = text_f1
-
-    clinical = compute_clinical_entity_metrics(response_text, answer_text)
-    metrics['Clinical_Entity_P'] = clinical['precision']
-    metrics['Clinical_Entity_R'] = clinical['recall']
-    metrics['Clinical_Entity_F1'] = clinical['f1']
-
-    entity_errors = compute_entity_error_metrics(response_text, answer_text)
-    metrics['Entity_Hallucination_Rate'] = entity_errors['hallucination_rate']
-    metrics['Entity_Omission_Rate'] = entity_errors['omission_rate']
-    metrics['Entity_Factual_Precision'] = entity_errors['factual_precision']
-
-    chexbert_fp = compute_factual_precision_chexbert(response_text, answer_text)
-    if chexbert_fp is not None:
-        metrics['CheXbert_Factual_Precision'] = chexbert_fp
-
-    radgraph = compute_radgraph_f1(response_text, answer_text)
     metrics['radgraph_applicable'] = radgraph['applicable']
     metrics['RadGraph_F1'] = radgraph['f1']
     return metrics
+
+
+def compute_text_metric_bundles(
+    items: list[dict], *, include_radgraph: bool = True
+) -> list[dict]:
+    """Build normalized text/EM metadata and optionally run RadGraph.
+
+    The main table uses BLEU, PubMedBERTScore, and closed-form EM, but not
+    RadGraph.  Keeping normalization and EM independent from the optional
+    RadGraph model makes a full-table metric run substantially cheaper.
+    """
+    bundles = [_text_metric_bundle_without_radgraph(item) for item in items]
+    if not include_radgraph:
+        for bundle in bundles:
+            bundle['radgraph_applicable'] = False
+            bundle['RadGraph_F1'] = None
+        return bundles
+    radgraph_results = compute_radgraph_f1_batch(
+        [bundle['normalized_response_text'] for bundle in bundles],
+        [bundle['normalized_answer_text'] for bundle in bundles],
+    )
+    for bundle, radgraph in zip(bundles, radgraph_results):
+        bundle['radgraph_applicable'] = radgraph['applicable']
+        bundle['RadGraph_F1'] = radgraph['f1']
+    return bundles
 
 
 def append_metric_value(all_metrics: defaultdict, metric_name: str, value) -> None:
@@ -349,7 +370,7 @@ def append_metric_value(all_metrics: defaultdict, metric_name: str, value) -> No
 
 
 def bootstrap_ci(values, n_boot: int = 1000, alpha: float = 0.05, seed: int = 42) -> dict:
-    """对单条指标输出 bootstrap 95% CI（替代仅 mean/std 的榜单式比较）。"""
+    """Compute a bootstrap 95% confidence interval for one metric instead of a mean/std-only comparison."""
     arr = np.asarray([float(v) for v in values], dtype=float)
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
@@ -368,11 +389,11 @@ def bootstrap_ci(values, n_boot: int = 1000, alpha: float = 0.05, seed: int = 42
 
 
 def paired_wilcoxon_test(scores_a, scores_b, metric_name: str) -> dict:
-    """对同一批样本的两组分数做配对 Wilcoxon signed-rank 检验。"""
+    """Run a paired Wilcoxon signed-rank test on two score sets from the same samples."""
     try:
         from scipy.stats import wilcoxon
     except ImportError:
-        return {'metric': metric_name, 'applicable': False, 'error': 'scipy 不可用'}
+        return {'metric': metric_name, 'applicable': False, 'error': 'scipy is unavailable'}
     arr_a = np.asarray([float(v) for v in scores_a], dtype=float)
     arr_b = np.asarray([float(v) for v in scores_b], dtype=float)
     mask = np.isfinite(arr_a) & np.isfinite(arr_b)
@@ -403,12 +424,77 @@ def paired_wilcoxon_test(scores_a, scores_b, metric_name: str) -> dict:
     }
 
 
+def valid_judge_result(result: object) -> bool:
+    """Return whether a judge response is complete enough to be checkpointed.
+
+    Empty/API-error/legacy JSON must be retried rather than silently counted as
+    a completed VLM evaluation.  Scores are constrained to the documented
+    1--10 rubric to avoid accepting malformed parser output.
+    """
+    if not isinstance(result, dict):
+        return False
+    all_score_fields = [*JUDGE_DIMENSIONS, 'overall_score']
+    for field in all_score_fields:
+        if field == 'overall_score':
+            value = result.get(field)
+        else:
+            section = result.get(field)
+            value = section.get('score') if isinstance(section, dict) else None
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return False
+        if not np.isfinite(value) or not 1.0 <= float(value) <= 10.0:
+            return False
+    return True
+
+
+def judge_result_is_complete(item: dict, task: str) -> bool:
+    """Check every judge view that this task's available inputs require."""
+    expects_w_gt = bool(
+        item.get('input_image')
+        if task == 'vqa'
+        else item.get('ground_truth_image') and item.get('output_image')
+    )
+    expects_wo_gt = bool(item.get('input_image'))
+    return (
+        (not expects_w_gt or valid_judge_result(item.get('vlm_judge_w_gt_result')))
+        and (not expects_wo_gt or valid_judge_result(item.get('vlm_judge_wo_gt_result')))
+    )
+
+
+def local_metrics_are_complete(
+    item: dict, task: str, *, require_radgraph: bool = True
+) -> bool:
+    """Check the required local metrics without relying on a version marker."""
+    required = []
+    if task in {'image_edit', 'multimodal_generation'}:
+        required.extend(['LPIPS', 'PSNR', 'SSIM', 'MedImageInsight_Similarity'])
+    if task in {'vqa', 'multimodal_generation'}:
+        required.extend(['BLEU', 'BERT_Score'])
+        if require_radgraph:
+            if 'radgraph_applicable' not in item:
+                return False
+            if item.get('radgraph_applicable') and not isinstance(item.get('RadGraph_F1'), (int, float)):
+                return False
+    return all(
+        isinstance(item.get(metric), (int, float))
+        and not isinstance(item.get(metric), bool)
+        and np.isfinite(item[metric])
+        for metric in required
+    )
+
+
+def append_judge_metrics(all_metrics: defaultdict, judge: object, suffix: str) -> None:
+    """Append only the current five clinical judge dimensions and overall score."""
+    if not valid_judge_result(judge):
+        return
+    for source_key, metric_prefix in JUDGE_DIMENSIONS.items():
+        append_metric_value(all_metrics, f'{metric_prefix}_{suffix}', judge[source_key]['score'])
+    append_metric_value(all_metrics, f'VLM_Overall_Score_{suffix}', judge['overall_score'])
+
+
 def classify_failure_modes(record: dict, task: str) -> list:
-    """把单条记录归入可解释的失败模式（供论文错误分析章节引用）。"""
+    """Assign one record to interpretable failure modes for the paper's error analysis."""
     modes = []
-    clinical_f1 = record.get('Clinical_Entity_F1')
-    hallucination = record.get('Entity_Hallucination_Rate')
-    omission = record.get('Entity_Omission_Rate')
     judge = record.get('vlm_judge_w_gt_result')
     instruction = (
         judge.get('instruction_compliance', {}).get('score')
@@ -416,17 +502,27 @@ def classify_failure_modes(record: dict, task: str) -> list:
         else None
     )
 
-    if isinstance(hallucination, (int, float)) and hallucination > 0:
-        modes.append('entity_hallucination')
-    if isinstance(omission, (int, float)) and omission > 0:
-        modes.append('entity_omission')
+    finding_accuracy = (
+        judge.get('clinical_finding_accuracy', {}).get('score')
+        if isinstance(judge, dict)
+        else None
+    )
+    hallucination_control = (
+        judge.get('hallucination_omission_control', {}).get('score')
+        if isinstance(judge, dict)
+        else None
+    )
+    if isinstance(finding_accuracy, (int, float)) and finding_accuracy < 6:
+        modes.append('low_clinical_finding_accuracy')
+    if isinstance(hallucination_control, (int, float)) and hallucination_control < 6:
+        modes.append('judge_detected_hallucination_or_omission')
     if isinstance(instruction, (int, float)) and instruction < 6:
         modes.append('low_instruction_compliance')
     return modes
 
 
 def build_error_analysis(records: dict, task: str) -> dict:
-    """按 modality / paper_task 分解指标，并统计失败模式分布。"""
+    """Break down metrics by modality and paper task, and summarize failure-mode distributions."""
     items = [r for r in records.values() if isinstance(r, dict)]
     by_modality = defaultdict(lambda: defaultdict(list))
     by_paper_task = defaultdict(lambda: defaultdict(list))
@@ -468,7 +564,7 @@ def build_error_analysis(records: dict, task: str) -> dict:
 
 
 def load_result_records(jsonl_path: str) -> dict:
-    """读取已评测 JSONL，按 sample_id 建立 {id: record} 索引。"""
+    """Load evaluated JSONL records into a {sample_id: record} index."""
     records = {}
     for line in load_jsonl_data(jsonl_path):
         if not isinstance(line, dict):
@@ -483,17 +579,17 @@ async def analyze_model_comparison(
     task: str,
     n_boot: int = 1000,
 ) -> dict:
-    """对同一模型集合的任意两模型结果做配对 Wilcoxon 检验 + bootstrap CI。
+    """Run paired Wilcoxon tests and bootstrap confidence intervals for every model pair.
 
-    输入为多个已评测的 JSONL（同一样本集、不同模型输出），按 sample_id 配对。
+    Input consists of evaluated JSONL files for the same samples and different model outputs, paired by sample_id.
     """
     if len(jsonl_paths) < 2:
-        raise ValueError('--mission stats 需要至少两个结果文件（同一样本集的不同模型输出）')
+        raise ValueError('--mission stats requires at least two result files for the same samples with different model outputs')
     model_records = []
     for path in jsonl_paths:
         records = load_result_records(path)
         if not records:
-            raise ValueError(f'结果文件为空: {path}')
+            raise ValueError(f'Result file is empty: {path}')
         model_records.append((path, records))
 
     common_ids = set(model_records[0][1].keys())
@@ -501,10 +597,10 @@ async def analyze_model_comparison(
         common_ids &= set(records.keys())
     common_ids = sorted(common_ids)
     if len(common_ids) < 2:
-        raise ValueError('不同模型结果文件的 sample_id 交集过小，无法进行配对统计')
+        raise ValueError('Result files have too few shared sample_id values for paired statistics')
 
     model_names = [os.path.splitext(os.path.basename(p))[0] for p in jsonl_paths]
-    # 先收集所有指标名
+    # Collect all metric names first.
     metric_names = set()
     for _, records in model_records:
         for sample_id in common_ids:
@@ -550,33 +646,38 @@ async def analyze_model_comparison(
 
 
 def save_results_for_stats(results: dict, jsonl_paths: list):
-    """将多模型统计结果保存到 ./eval_results/。"""
-    output_dir = './eval_results'
+    """Save multi-model statistics to ./eval_results/."""
+    output_dir = os.environ.get('MEDGEN_EVAL_RESULTS_DIR', './eval_results')
     os.makedirs(output_dir, exist_ok=True)
     parts = [os.path.splitext(os.path.basename(p))[0] for p in jsonl_paths[:4]]
     output_path = os.path.join(output_dir, '_'.join(parts) + '_stats_results.json')
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4)
-    logging.info(f"统计结果已成功保存到: {output_path}")
+    logging.info(f"Statistics saved to: {output_path}")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="评估多模态模型生成结果的脚本")
-    parser.add_argument('--data_path', type=str, default="./MedGEN", help='输入的jsonl文件路径')
-    parser.add_argument('--jsonl_path', type=str, nargs='+', required=True, help='输入的jsonl文件路径（stats 模式可传多个）')
-    parser.add_argument('--batch_size', type=int, default=8, help='处理数据的批大小')
-    parser.add_argument('--mission', type=str, choices=['basic_eval', 'type_wise', 'stats'], default='basic_eval', help='评估任务类型')
-    parser.add_argument('--type_key', type=str, default='modality', help='当 mission 为 type_wise 时，用于分类的键名')
-    parser.add_argument('--task', type=str, choices=['multimodal_generation', 'image_edit', 'vqa'], default='multimodal_generation', help='具体的评测任务类型 (multimodal_generation, image_edit, vqa)')
-    parser.add_argument('--max_samples', type=int, default=None, help='只读取前N条记录')
-    parser.add_argument('--bootstrap_samples', type=int, default=BOOTSTRAP_SAMPLES, help='bootstrap 重采样次数（默认 1000）')
-    parser.add_argument('--validate-only', action='store_true', help='仅校验评测输入和图片路径，不加载指标模型或调用API')
-    parser.add_argument('--require-full-task-coverage', action='store_true', help='要求输入覆盖全部16个论文任务；否则仅报告缺失任务')
-    parser.add_argument('--local-metrics-only', action='store_true', help='执行本地指标但跳过付费 VLM judge；仅支持 basic_eval')
-    parser.add_argument('--judge_model', type=str, default='', help='VLM judge 模型名（留空时从 --judge_config 读取）')
-    parser.add_argument('--judge_config', type=str, default='./api/config.vllm.yaml', help='本地 vLLM 医学 VLM judge 配置文件')
-    parser.add_argument('--judge_backend', type=str, choices=['api'], default='api', help='OpenAI-compatible API；默认指向本地 vLLM')
-    parser.add_argument('--enable_clinical_text_metrics', action='store_true', default=True, help='开启 clinical text metrics')
+    parser = argparse.ArgumentParser(description="Evaluate multimodal model outputs")
+    parser.add_argument('--data_path', type=str, default="./MedGEN", help='Path to the input JSONL file')
+    parser.add_argument('--jsonl_path', type=str, nargs='+', required=True, help='Input JSONL path(s); stats mode accepts multiple files')
+    parser.add_argument('--batch_size', type=int, default=8, help='Evaluation batch size')
+    parser.add_argument('--mission', type=str, choices=['basic_eval', 'type_wise', 'stats'], default='basic_eval', help='Evaluation mission')
+    parser.add_argument('--type_key', type=str, default='modality', help='Record key used for grouping in type_wise mode')
+    parser.add_argument('--task', type=str, choices=['multimodal_generation', 'image_edit', 'vqa'], default='multimodal_generation', help='Evaluation task type (multimodal_generation, image_edit, vqa)')
+    parser.add_argument('--max_samples', type=int, default=None, help='Read only the first N records')
+    parser.add_argument('--bootstrap_samples', type=int, default=BOOTSTRAP_SAMPLES, help='Bootstrap resampling count (default: 1000)')
+    parser.add_argument('--validate-only', action='store_true', help='Validate inputs and image paths without loading metric models or calling an API')
+    parser.add_argument('--require-full-task-coverage', action='store_true', help='Require all 16 paper tasks; otherwise report missing tasks')
+    parser.add_argument('--local-metrics-only', action='store_true', help='Run local metrics and skip the paid VLM judge; supported only by basic_eval')
+    parser.add_argument('--judge_model', type=str, default='', help='VLM judge model name; uses --judge_config when omitted')
+    parser.add_argument('--judge_config', type=str, default='./api/config.vllm.yaml', help='Local vLLM medical VLM judge configuration file')
+    parser.add_argument('--judge_backend', type=str, choices=['api'], default='api', help='OpenAI-compatible API; defaults to local vLLM')
+    parser.add_argument('--enable_clinical_text_metrics', action='store_true', default=True, help='Enable clinical text metrics')
+    parser.add_argument(
+        '--disable_radgraph',
+        action='store_true',
+        help='Skip RadGraph, which is not used in the main table, while retaining text normalization, BLEU, PubMedBERTScore, and closed-form EM',
+    )
     return parser
 
 
@@ -588,233 +689,10 @@ def build_vlm_judge_client(
 ):
     if not run_vlm_judge:
         return None
-    # 优先级: --judge_model > 配置文件 model_name > 默认医学 VLM
+    # Priority: --judge_model > config model_name > default medical VLM
     selected_model = judge_model or ""
     return double_image_vlm(config_path=judge_config, model_name=selected_model)
 
-
-# async def basic_eval(data: list, batch_size: int, task: str, data_path: str, jsonl_path: str) -> dict:
-#     """对给定的数据集子集执行基础评估，并支持断点续评和保存带VLM结果的中间文件"""
-#     vlm_client = double_image_vlm()
-#     all_metrics = defaultdict(list)
-
-#     # --- 构建中间结果保存路径 ---
-#     eval_results_dir = './eval_results'
-#     os.makedirs(eval_results_dir, exist_ok=True)
-#     base_name = os.path.basename(jsonl_path)
-#     intermediate_file = os.path.join(eval_results_dir, os.path.splitext(base_name)[0] + '_with_vlm.jsonl')
-
-#     # --- 1. 加载已有中间结果 ---
-#     existing_data = {}  # uid -> item
-#     if os.path.exists(intermediate_file):
-#         with open(intermediate_file, 'r', encoding='utf-8') as f:
-#             for line in f:
-#                 item = json.loads(line)
-#                 uid = generate_sample_id(item)
-#                 existing_data[uid] = item
-#         logging.info(f"检测到中间结果文件，已加载 {len(existing_data)} 条已评测样本。")
-
-#     # --- 2. 明确分离已处理和未处理的样本 ---
-#     unprocessed_items = []
-#     already_processed_items = []
-#     for item in data:
-#         uid = generate_sample_id(item)
-#         if uid in existing_data:
-#             # 使用已加载的、带有VLM结果的完整数据
-#             already_processed_items.append(existing_data[uid])
-#         else:
-#             unprocessed_items.append(item)
-
-#     # --- 3. 预加载已处理样本的指标 ---
-#     logging.info(f"发现 {len(already_processed_items)} 条已处理样本，将直接加载其结果。")
-#     for item in already_processed_items:
-#         judge_w_gt = item.get('vlm_judge_w_gt_result')
-#         judge_wo_gt = item.get('vlm_judge_wo_gt_result')
-
-#         if judge_w_gt:
-#             if task == 'multimodal_generation':
-#                 all_metrics['VLM_Coherence_W_GT'].append(judge_w_gt.get('coherence', {}).get('score', 0))
-#                 all_metrics['VLM_Visual_Textual_Alignment_W_GT'].append(judge_w_gt.get('visual_textual_alignment', {}).get('score', 0))
-#             all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
-#             all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-#             all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
-#             all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
-
-#         if judge_wo_gt:
-#             if task == 'multimodal_generation':
-#                 all_metrics['VLM_Coherence_WO_GT'].append(judge_wo_gt.get('coherence', {}).get('score', 0))
-#                 all_metrics['VLM_Visual_Textual_Alignment_WO_GT'].append(judge_wo_gt.get('visual_textual_alignment', {}).get('score', 0))
-#             all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
-#             all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-#             all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
-#             all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
-            
-#     # --- 动态调整 Prompt（保持原逻辑）---
-#     current_vlm_holistic_judge_w_gt_prompt = list(vlm_holistic_judge_w_gt_prompt)
-#     current_vlm_holistic_judge_wo_gt_prompt = list(vlm_holistic_judge_wo_gt_prompt)
-#     if task != 'multimodal_generation':
-#         current_vlm_holistic_judge_w_gt_prompt[1] = ""
-#         current_vlm_holistic_judge_wo_gt_prompt[1] = ""
-#         current_vlm_holistic_judge_w_gt_prompt[3] = ""
-#         current_vlm_holistic_judge_wo_gt_prompt[3] = ""
-
-#     # 完整结果字典，用于每次覆盖写入
-#     full_results_dict = dict(existing_data)
-
-#     # --- 4. 只对未处理的样本进行迭代和评估 ---
-#     if not unprocessed_items:
-#         logging.info("所有样本均已处理完毕，无需执行新的评估。")
-#     else:
-#         logging.info(f"开始处理 {len(unprocessed_items)} 条新样本。")
-
-#     total_batches = (len(unprocessed_items) + batch_size - 1) // batch_size
-#     for i in tqdm(range(0, len(unprocessed_items), batch_size), desc="Evaluating Batches", total=total_batches):
-#         batch_data = unprocessed_items[i:i+batch_size]
-
-#         # --- 准备异步任务 (这部分逻辑和原来一致) ---
-#         vlm_judge_w_gt_requests = []
-#         vlm_judge_wo_gt_requests = []
-#         request_to_index = []
-
-#         eval_images, ref_images = [], []
-#         eval_texts, ref_texts = [], []
-
-#         for idx, item in enumerate(batch_data):
-#             # 准备图像/文本/VLM请求
-#             if task in ['multimodal_generation', 'image_edit']:
-#                 try:
-#                     eval_images.append(Image.open(item['output_image']).convert('RGB'))
-#                     ref_images.append(Image.open(os.path.join(data_path, item['input_image'])).convert('RGB'))
-#                 except (FileNotFoundError, IOError) as e:
-#                     logging.warning(f"无法加载图片，跳过图像指标计算: {e}")
-
-#             if task in ['multimodal_generation', 'vqa']:
-#                 eval_texts.append(item.get('response', ''))
-#                 ref_texts.append(item.get('instruction', ''))
-
-#             # VLM with GT
-#             w_gt_prompt = "\n".join([
-#                 current_vlm_holistic_judge_w_gt_prompt[0], current_vlm_holistic_judge_w_gt_prompt[1],
-#                 current_vlm_holistic_judge_w_gt_prompt[2], current_vlm_holistic_judge_w_gt_prompt[3],
-#                 current_vlm_holistic_judge_w_gt_prompt[4], item.get('instruction', 'N/A'),
-#                 current_vlm_holistic_judge_w_gt_prompt[5], item.get('answer', 'N/A'),
-#                 current_vlm_holistic_judge_w_gt_prompt[6], item.get('response', 'N/A'),
-#                 current_vlm_holistic_judge_w_gt_prompt[7]
-#             ])
-#             if 'ground_truth_image' in item and 'output_image' in item:
-#                 vlm_judge_w_gt_requests.append(
-#                     (w_gt_prompt, os.path.join(data_path, item['ground_truth_image']), item['output_image'], "Ground Truth", "Generated Answer", None, None)
-#                 )
-#                 request_to_index.append(('w_gt', idx))
-
-#             # VLM w/o GT
-#             wo_gt_prompt = "\n".join([
-#                 current_vlm_holistic_judge_wo_gt_prompt[0], current_vlm_holistic_judge_wo_gt_prompt[1],
-#                 current_vlm_holistic_judge_wo_gt_prompt[2], current_vlm_holistic_judge_wo_gt_prompt[3],
-#                 current_vlm_holistic_judge_wo_gt_prompt[4], item.get('instruction', 'N/A'),
-#                 current_vlm_holistic_judge_wo_gt_prompt[5],
-#                 current_vlm_holistic_judge_wo_gt_prompt[6], item.get('response', 'N/A'),
-#                 current_vlm_holistic_judge_wo_gt_prompt[7]
-#             ])
-#             if 'input_image' in item and 'output_image' in item:
-#                 vlm_judge_wo_gt_requests.append(
-#                     (wo_gt_prompt, os.path.join(data_path, item['input_image']), item['output_image'], "Input", "Output", None, None)
-#                 )
-#                 request_to_index.append(('wo_gt', idx))
-
-#         # --- 执行非VLM任务 ---
-#         tasks_to_run = []
-#         if task in ['multimodal_generation', 'image_edit'] and eval_images:
-#             tasks_to_run.extend([
-#                 batch_async_FR_IQA(eval_images, ref_images, 'lpips'),
-#                 batch_async_FR_IQA(eval_images, ref_images, 'psnr'),
-#                 batch_async_FR_IQA(eval_images, ref_images, 'ssim')
-#             ])
-#         if task in ['multimodal_generation', 'vqa'] and eval_texts:
-#             tasks_to_run.extend([
-#                 batch_async_evaluate_text_quality(eval_texts, ref_texts, 'bleu'),
-#                 batch_async_evaluate_text_quality(eval_texts, ref_texts, 'bertscore')
-#             ])
-        
-#         results = await asyncio.gather(*tasks_to_run, return_exceptions=True) if tasks_to_run else []
-#         # (解析和添加非VLM指标到 all_metrics 的逻辑保持不变)
-#         res_idx = 0
-#         if eval_images:
-#             for metric_name in ['LPIPS', 'PSNR', 'SSIM']:
-#                 val = results[res_idx]; all_metrics[metric_name].extend(val if not isinstance(val, Exception) else [0.0] * len(eval_images)); res_idx += 1
-#         if eval_texts:
-#             for metric_name in ['BLEU', 'BERT_Score']:
-#                 val = results[res_idx]; all_metrics[metric_name].extend(val if not isinstance(val, Exception) else [0.0] * len(eval_texts)); res_idx += 1
-
-#         # --- 执行 VLM Judge ---
-#         vlm_tasks = []
-#         if vlm_judge_w_gt_requests: vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
-#         if vlm_judge_wo_gt_requests: vlm_tasks.append(vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=8))
-#         vlm_results = await asyncio.gather(*vlm_tasks, return_exceptions=True) if vlm_tasks else []
-
-#         # --- 解析VLM结果并更新batch_data中的item ---
-#         vlm_res_idx, request_ptr = 0, 0
-#         if vlm_judge_w_gt_requests:
-#             w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-#             for res in w_gt_results:
-#                 req_type, data_idx = request_to_index[request_ptr]
-#                 item = batch_data[data_idx]
-#                 if res and not res.get('error'): item['vlm_judge_w_gt_result'] = extract_json(res['text'])
-#                 else: item['vlm_judge_w_gt_result'] = {}
-#                 request_ptr += 1
-#             vlm_res_idx += 1
-        
-#         if vlm_judge_wo_gt_requests:
-#             wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-#             for res in wo_gt_results:
-#                 req_type, data_idx = request_to_index[request_ptr]
-#                 item = batch_data[data_idx]
-#                 if res and not res.get('error'): item['vlm_judge_wo_gt_result'] = extract_json(res['text'])
-#                 else: item['vlm_judge_wo_gt_result'] = {}
-#                 request_ptr += 1
-
-#         # --- 将新处理完的结果添加到 all_metrics 和 full_results_dict ---
-#         for item in batch_data:
-#             # 添加到 all_metrics
-#             judge_w_gt = item.get('vlm_judge_w_gt_result', {})
-#             judge_wo_gt = item.get('vlm_judge_wo_gt_result', {})
-#             if judge_w_gt:
-#                 if task == 'multimodal_generation':
-#                     all_metrics['VLM_Coherence_W_GT'].append(judge_w_gt.get('coherence', {}).get('score', 0))
-#                     all_metrics['VLM_Visual_Textual_Alignment_W_GT'].append(judge_w_gt.get('visual_textual_alignment', {}).get('score', 0))
-#                 all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
-#                 all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-#                 all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
-#                 all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
-#             if judge_wo_gt:
-#                 if task == 'multimodal_generation':
-#                     all_metrics['VLM_Coherence_WO_GT'].append(judge_wo_gt.get('coherence', {}).get('score', 0))
-#                     all_metrics['VLM_Visual_Textual_Alignment_WO_GT'].append(judge_wo_gt.get('visual_textual_alignment', {}).get('score', 0))
-#                 all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
-#                 all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-#                 all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
-#                 all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
-
-#             # 更新用于保存的字典
-#             uid = generate_sample_id(item)
-#             full_results_dict[uid] = item
-
-#         # --- 5. 每次处理完批次后，覆盖写入完整的中间文件 ---
-#         with open(intermediate_file, 'w', encoding='utf-8') as f:
-#             for item in full_results_dict.values():
-#                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
-
-#     # --- 聚合最终结果 (现在 all_metrics 包含了旧样本和新样本的所有数据) ---
-#     final_results = {}
-#     for metric, values in all_metrics.items():
-#         if values:
-#             final_results[f"Average_{metric}"] = float(np.mean(values))
-
-#     accuracy_rates = calculate_accuracy_rates(all_metrics)
-#     final_results.update(accuracy_rates)
-
-#     logging.info(f"评估完成。中间结果已保存至: {intermediate_file}")
-#     return final_results
 
 
 async def basic_eval(
@@ -828,127 +706,155 @@ async def basic_eval(
     judge_backend: str = 'api',
     judge_config: str = './api/config.vllm.yaml',
     enable_clinical_text_metrics: bool = True,
+    enable_radgraph: bool = True,
     n_boot: int = BOOTSTRAP_SAMPLES,
 ) -> dict:
     """
-    对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
+    Run basic evaluation for a dataset subset with checkpoint/resume support for image, text, and VLM metrics.
     """
     for item in data:
         validate_paper_task(paper_task_for_item(item))
     vlm_client = build_vlm_judge_client(run_vlm_judge, judge_model, judge_backend, judge_config)
+    # The reference-aware and reference-free views are submitted together.
+    # A per-view concurrency of one therefore keeps at most two image-bearing
+    # requests in flight on the shared GPU during the conservative default run.
+    judge_concurrency = max(1, int(os.environ.get('MEDGEN_JUDGE_CONCURRENCY', '1')))
+    profile_timing = os.environ.get('MEDGEN_PROFILE_TIMING', '0') == '1'
+    overlap_local_and_judge = (
+        run_vlm_judge
+        and os.environ.get('MEDGEN_OVERLAP_LOCAL_AND_JUDGE', '0') == '1'
+    )
     all_metrics = defaultdict(list)
     text_metric_sample_count = 0
     radgraph_applicable_count = 0
 
-    # --- 1. 构建并加载中间结果 ---
-    eval_results_dir = './eval_results'
+    # --- 1. Build and load checkpoint results ---
+    eval_results_dir = os.environ.get('MEDGEN_EVAL_RESULTS_DIR', './eval_results')
     os.makedirs(eval_results_dir, exist_ok=True)
     base_name = os.path.basename(jsonl_path)
     suffix = '_with_vlm.jsonl' if run_vlm_judge else '_local_metrics.jsonl'
     intermediate_file = os.path.join(
         eval_results_dir, os.path.splitext(base_name)[0] + suffix
     )
+    journal_file = intermediate_file + '.journal'
 
     existing_data = {}  # uid -> item with all metrics
-    if os.path.exists(intermediate_file):
-        with open(intermediate_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                item = json.loads(line)
-                # 使用 item 的部分内容生成唯一ID
-                uid = generate_sample_id(item)
-                existing_data[uid] = item
-        logging.info(f"检测到中间结果文件，已加载 {len(existing_data)} 条已评测样本。")
+    loaded_checkpoint_rows = 0
+    for checkpoint_path in (intermediate_file, journal_file):
+        if os.path.exists(checkpoint_path):
+            with open(checkpoint_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    item = json.loads(line)
+                    loaded_checkpoint_rows += 1
+                    # Invalidate old local-metric records and never propagate
+                    # removed metrics or the former Rad-DINO field.
+                    for obsolete_key in (
+                        'Task_Accuracy', 'Text_F1', 'Anatomical_Embedding_Similarity',
+                        'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
+                        'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
+                        'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
+                    ):
+                        item.pop(obsolete_key, None)
+                    uid = generate_sample_id(item)
+                    existing_data[uid] = item
+    if loaded_checkpoint_rows:
+        logging.info(
+            "Found checkpoint file; loaded %d rows for %d unique samples.",
+            loaded_checkpoint_rows,
+            len(existing_data),
+        )
 
-    # --- 2. 区分已处理和未处理的样本 ---
+    # --- 2. Separate processed and unprocessed samples ---
     unprocessed_items = []
     already_processed_items = []
-    completion_key = 'vlm_judge_w_gt_result' if run_vlm_judge else '_local_metrics_complete'
     for item in data:
         uid = generate_sample_id(item)
-        if uid in existing_data and completion_key in existing_data[uid]:
-            # 使用已加载的、带有所有指标的完整数据
+        existing_item = existing_data.get(uid)
+        is_complete = (
+            judge_result_is_complete(existing_item, task)
+            and local_metrics_are_complete(
+                existing_item, task, require_radgraph=enable_radgraph
+            )
+            if run_vlm_judge and isinstance(existing_item, dict)
+            else bool(
+                isinstance(existing_item, dict)
+                and existing_item.get('_local_metrics_complete')
+                and existing_item.get('_local_metrics_version') == LOCAL_METRICS_VERSION
+                and (enable_radgraph or existing_item.get('_radgraph_disabled') is True)
+            )
+        )
+        if (
+            existing_item is not None
+            and is_complete
+        ):
+            # Use the loaded complete record with all metrics.
             already_processed_items.append(existing_data[uid])
         else:
-            unprocessed_items.append(item)
+            if isinstance(existing_item, dict):
+                # Preserve any valid judge view/local metrics from an interrupted
+                # batch so recovery only requests the missing view.
+                merged_item = dict(item)
+                merged_item.update(existing_item)
+                unprocessed_items.append(merged_item)
+            else:
+                unprocessed_items.append(item)
 
-    # --- 3. 预加载所有已处理样本的指标（图片、文本、VLM） ---
-    logging.info(f"发现 {len(already_processed_items)} 条已完整处理的样本，将直接加载其所有结果。")
+    # --- 3. Preload metrics for all processed samples (image, text, and VLM) ---
+    logging.info(f"Found {len(already_processed_items)} fully processed samples; loading their results directly.")
     for item in already_processed_items:
-        # 加载图片和文本指标
+        # Load image and text metrics.
         for metric_key in [
             'LPIPS', 'PSNR', 'SSIM',
-            'Anatomical_Embedding_Similarity',
-            'BLEU', 'BERT_Score',
-            'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
-            'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
-            'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
-            'Task_Accuracy', 'Text_EM', 'Text_F1'
+            'MedImageInsight_Similarity',
+            'BLEU', 'BERT_Score', 'RadGraph_F1', 'Text_EM'
         ]:
-            if metric_key in item:
-                all_metrics[metric_key].append(item[metric_key])
+            append_metric_value(all_metrics, metric_key, item.get(metric_key))
         if enable_clinical_text_metrics and 'normalized_answer_text' in item:
             text_metric_sample_count += 1
             if item.get('radgraph_applicable'):
                 radgraph_applicable_count += 1
-                append_metric_value(all_metrics, 'RadGraph_F1', item.get('RadGraph_F1'))
 
-        # 加载VLM Judge指标
+        # Load VLM judge metrics.
         judge_w_gt = item.get('vlm_judge_w_gt_result')
         judge_wo_gt = item.get('vlm_judge_wo_gt_result')
 
-        if judge_w_gt:
-            if task == 'multimodal_generation':
-                all_metrics['VLM_Coherence_W_GT'].append(judge_w_gt.get('coherence', {}).get('score', 0))
-                all_metrics['VLM_Visual_Textual_Alignment_W_GT'].append(judge_w_gt.get('visual_textual_alignment', {}).get('score', 0))
-            all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
-            all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-            all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
-            append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_W_GT', judge_w_gt.get('anatomical_accuracy', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_W_GT', judge_w_gt.get('clinical_finding_accuracy', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Instruction_Compliance_W_GT', judge_w_gt.get('instruction_compliance', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_W_GT', judge_w_gt.get('cross_modal_consistency', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_W_GT', judge_w_gt.get('hallucination_omission_control', {}).get('score'))
-            all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
+        append_judge_metrics(all_metrics, judge_w_gt, 'W_GT')
+        append_judge_metrics(all_metrics, judge_wo_gt, 'WO_GT')
 
-        if judge_wo_gt:
-            if task == 'multimodal_generation':
-                all_metrics['VLM_Coherence_WO_GT'].append(judge_wo_gt.get('coherence', {}).get('score', 0))
-                all_metrics['VLM_Visual_Textual_Alignment_WO_GT'].append(judge_wo_gt.get('visual_textual_alignment', {}).get('score', 0))
-            all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
-            all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-            all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
-            append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_WO_GT', judge_wo_gt.get('anatomical_accuracy', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_WO_GT', judge_wo_gt.get('clinical_finding_accuracy', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Instruction_Compliance_WO_GT', judge_wo_gt.get('instruction_compliance', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_WO_GT', judge_wo_gt.get('cross_modal_consistency', {}).get('score'))
-            append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_WO_GT', judge_wo_gt.get('hallucination_omission_control', {}).get('score'))
-            all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
-
-    # --- 按任务生成结构化检查清单 judge prompt（所有任务均覆盖 5 维临床评分）---
+    # --- Build a task-specific structured checklist prompt covering all five clinical dimensions---
     current_vlm_holistic_judge_w_gt_prompt = build_vlm_judge_prompt(task, with_gt=True)
     current_vlm_holistic_judge_wo_gt_prompt = build_vlm_judge_prompt(task, with_gt=False)
 
-    # 完整结果字典，用于每次覆盖写入
+    # Complete result dictionary for checkpoint overwrites.
     full_results_dict = dict(existing_data)
 
-    # --- 4. 只对未处理的样本进行迭代和评估 ---
+    # --- 4. Iterate over and evaluate only unprocessed samples ---
     if not unprocessed_items:
-        logging.info("所有样本均已处理完毕，无需执行新的评估。")
+        logging.info("All samples are already processed; no new evaluation is required.")
     else:
-        logging.info(f"开始处理 {len(unprocessed_items)} 条新样本。")
+        logging.info(f"Processing {len(unprocessed_items)} new samples.")
 
     total_batches = (len(unprocessed_items) + batch_size - 1) // batch_size
     for i in tqdm(range(0, len(unprocessed_items), batch_size), desc="Evaluating Batches", total=total_batches):
+        batch_started = time.perf_counter()
+        batch_number = i // batch_size + 1
         batch_data = unprocessed_items[i:i+batch_size]
+        prepare_started = time.perf_counter()
 
-        # --- 准备异步任务 (这部分逻辑和原来一致) ---
+        text_bundles = None
+        if task in ['multimodal_generation', 'vqa'] and enable_clinical_text_metrics:
+            text_bundles = compute_text_metric_bundles(
+                batch_data, include_radgraph=enable_radgraph
+            )
+
+        # --- Prepare asynchronous tasks. ---
         vlm_judge_w_gt_requests, vlm_judge_wo_gt_requests = [], []
         request_to_index = []
         eval_images, ref_images = [], []
         eval_texts, ref_texts = [], []
 
         for idx, item in enumerate(batch_data):
-            # ... (准备图像/文本/VLM请求的逻辑保持不变)
+            # ... (Prepare image, text, and VLM requests.)
             if task in ['multimodal_generation', 'image_edit']:
                 try:
                     eval_images.append(
@@ -962,32 +868,26 @@ async def basic_eval(
                     validate_paper_task(paper_task_for_item(item))
                 except (FileNotFoundError, IOError) as e:
                     raise RuntimeError(
-                        f"无法加载图像，不能生成完整本地指标: {e}"
+                        f"Could not load image; complete local metrics cannot be produced: {e}"
                     ) from e
             if task in ['multimodal_generation', 'vqa']:
                 if enable_clinical_text_metrics:
-                    bundle = compute_text_metric_bundle(item)
+                    bundle = text_bundles[idx]
                     for key, value in bundle.items():
                         item[key] = value
                     eval_texts.append(item.get('normalized_response_text', item.get('response', '')))
                     ref_texts.append(item.get('normalized_answer_text', item.get('answer', '')))
                     text_metric_sample_count += 1
-                    for metric_key in [
-                        'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
-                        'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
-                        'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
-                        'Task_Accuracy', 'Text_EM', 'Text_F1'
-                    ]:
+                    for metric_key in ['RadGraph_F1', 'Text_EM']:
                         append_metric_value(all_metrics, metric_key, item.get(metric_key))
                     if item.get('radgraph_applicable'):
                         radgraph_applicable_count += 1
-                        append_metric_value(all_metrics, 'RadGraph_F1', item.get('RadGraph_F1'))
                 else:
                     eval_texts.append(item.get('response', ''))
                     ref_texts.append(item.get('answer', ''))
             if not run_vlm_judge:
                 continue
-            # ... (VLM请求准备逻辑保持不变)
+            # ... (Prepare VLM requests.)
             w_gt_prompt = "\n".join([
                 current_vlm_holistic_judge_w_gt_prompt[0], current_vlm_holistic_judge_w_gt_prompt[1],
                 current_vlm_holistic_judge_w_gt_prompt[2], current_vlm_holistic_judge_w_gt_prompt[3],
@@ -996,7 +896,9 @@ async def basic_eval(
                 current_vlm_holistic_judge_w_gt_prompt[6], item.get('normalized_response_text', canonical_response_text(item)),
                 current_vlm_holistic_judge_w_gt_prompt[7]
             ])
-            if task == 'vqa' and item.get('input_image'):
+            needs_w_gt = not valid_judge_result(item.get('vlm_judge_w_gt_result'))
+            needs_wo_gt = not valid_judge_result(item.get('vlm_judge_wo_gt_result'))
+            if needs_w_gt and task == 'vqa' and item.get('input_image'):
                 vlm_judge_w_gt_requests.append(
                     (
                         w_gt_prompt,
@@ -1009,7 +911,7 @@ async def basic_eval(
                     )
                 )
                 request_to_index.append(('w_gt', idx))
-            elif item.get('ground_truth_image') and item.get('output_image'):
+            elif needs_w_gt and item.get('ground_truth_image') and item.get('output_image'):
                 vlm_judge_w_gt_requests.append(
                     (
                         w_gt_prompt,
@@ -1030,7 +932,7 @@ async def basic_eval(
                 current_vlm_holistic_judge_wo_gt_prompt[6], item.get('normalized_response_text', canonical_response_text(item)),
                 current_vlm_holistic_judge_wo_gt_prompt[7]
             ])
-            if item.get('input_image'):
+            if needs_wo_gt and item.get('input_image'):
                 vlm_judge_wo_gt_requests.append(
                     (
                         wo_gt_prompt,
@@ -1044,8 +946,32 @@ async def basic_eval(
                 )
                 request_to_index.append(('wo_gt', idx))
 
+        prepare_seconds = time.perf_counter() - prepare_started
 
-        # --- 执行并保存图片和文本指标 ---
+        prefetched_vlm_future = None
+        judge_started = None
+        if overlap_local_and_judge:
+            prefetched_vlm_tasks = []
+            if vlm_judge_w_gt_requests:
+                prefetched_vlm_tasks.append(
+                    vlm_client.generate_batch(
+                        vlm_judge_w_gt_requests, concurrency=judge_concurrency
+                    )
+                )
+            if vlm_judge_wo_gt_requests:
+                prefetched_vlm_tasks.append(
+                    vlm_client.generate_batch(
+                        vlm_judge_wo_gt_requests, concurrency=judge_concurrency
+                    )
+                )
+            if prefetched_vlm_tasks:
+                judge_started = time.perf_counter()
+                prefetched_vlm_future = asyncio.gather(
+                    *prefetched_vlm_tasks, return_exceptions=True
+                )
+
+
+        # --- Run and save image and text metrics ---
         # Run text metrics and the frozen clinical image encoder in this batch.
         metric_specs = []
         if task in ['multimodal_generation', 'vqa'] and eval_texts:
@@ -1058,26 +984,40 @@ async def basic_eval(
                 ('LPIPS', len(eval_images), batch_async_FR_IQA(eval_images, ref_images, 'lpips')),
                 ('PSNR', len(eval_images), batch_async_FR_IQA(eval_images, ref_images, 'psnr')),
                 ('SSIM', len(eval_images), batch_async_FR_IQA(eval_images, ref_images, 'ssim')),
-                ('ANATOMICAL', len(eval_images), batch_async_anatomical_metrics(eval_images, ref_images)),
+                ('MEDIMAGEINSIGHT', len(eval_images), batch_async_medimageinsight_metrics(eval_images, ref_images)),
             ])
 
-        metric_results = (
-            await asyncio.gather(
-                *(spec[2] for spec in metric_specs), return_exceptions=True
+        local_metrics_started = time.perf_counter()
+        if metric_specs and overlap_local_and_judge:
+            def run_metric_coroutines_in_worker():
+                results = []
+                for _, _, metric_coroutine in metric_specs:
+                    try:
+                        results.append(asyncio.run(metric_coroutine))
+                    except Exception as exc:
+                        results.append(exc)
+                return results
+
+            metric_results = await asyncio.to_thread(run_metric_coroutines_in_worker)
+        else:
+            metric_results = (
+                await asyncio.gather(
+                    *(spec[2] for spec in metric_specs), return_exceptions=True
+                )
+                if metric_specs else []
             )
-            if metric_specs else []
-        )
+        local_metrics_seconds = time.perf_counter() - local_metrics_started
         if task in ['multimodal_generation', 'image_edit'] and len(eval_images) != len(batch_data):
             raise RuntimeError(
-                f"图像指标输入不完整: batch={len(batch_data)}, images={len(eval_images)}"
+                f"Incomplete image-metric inputs: batch={len(batch_data)}, images={len(eval_images)}"
             )
         if task in ['multimodal_generation', 'vqa'] and len(eval_texts) != len(batch_data):
             raise RuntimeError(
-                f"文本指标输入不完整: batch={len(batch_data)}, texts={len(eval_texts)}"
+                f"Incomplete text-metric inputs: batch={len(batch_data)}, texts={len(eval_texts)}"
             )
         for (metric_name, sample_count, _), scores in zip(metric_specs, metric_results):
             if scores is None:
-                logging.warning("metric %s 返回 None，跳过", metric_name)
+                logging.warning("metric %s returned None; skipping", metric_name)
                 continue
             if isinstance(scores, Exception):
                 raise RuntimeError(f"metric {metric_name} failed; evaluation aborted") from scores
@@ -1085,7 +1025,7 @@ async def basic_eval(
                 raise RuntimeError(
                     f"metric {metric_name} returned {len(scores)} scores for {sample_count} samples"
                 )
-            if metric_name == 'ANATOMICAL':
+            if metric_name == 'MEDIMAGEINSIGHT':
                 for item_idx, metric_dict in enumerate(scores):
                     if not isinstance(metric_dict, dict):
                         continue
@@ -1098,215 +1038,267 @@ async def basic_eval(
             for item_idx, score in enumerate(scores):
                 batch_data[item_idx][metric_name] = score
 
-        # # --- 打印调试信息 ---
-        # print("len(vlm_judge_w_gt_requests):", len(vlm_judge_w_gt_requests))
-        # print("len(vlm_judge_wo_gt_requests):", len(vlm_judge_wo_gt_requests))
-        # print("len(request_to_index):", len(request_to_index))
 
-        # --- 为每类请求分别维护索引映射 ---
+        # --- Maintain an index mapping for each request type ---
         w_gt_request_to_index = []
         wo_gt_request_to_index = []
 
-        # 拆分 request_to_index
+        # Split request_to_index.
         w_gt_request_to_index = [x for x in request_to_index if x[0] == 'w_gt']
         wo_gt_request_to_index = [x for x in request_to_index if x[0] == 'wo_gt']
 
-        # --- 执行 VLM Judge ---
-        vlm_tasks = []
-        if vlm_judge_w_gt_requests:
-            vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
-        if vlm_judge_wo_gt_requests:
-            vlm_tasks.append(vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=8))
+        # --- Run the VLM judge ---
+        if prefetched_vlm_future is not None:
+            vlm_results = await prefetched_vlm_future
+        else:
+            judge_started = time.perf_counter()
+            vlm_tasks = []
+            if vlm_judge_w_gt_requests:
+                vlm_tasks.append(
+                    vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=judge_concurrency)
+                )
+            if vlm_judge_wo_gt_requests:
+                vlm_tasks.append(
+                    vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=judge_concurrency)
+                )
+            vlm_results = (
+                await asyncio.gather(*vlm_tasks, return_exceptions=True)
+                if vlm_tasks else []
+            )
+        judge_seconds = time.perf_counter() - judge_started
+        all_vlm_result_groups = list(vlm_results)
 
-        vlm_results = await asyncio.gather(*vlm_tasks, return_exceptions=True) if vlm_tasks else []
+        def apply_view_results(results, mapping, result_key, error_key):
+            for result_index, (_, data_idx) in enumerate(mapping):
+                res = results[result_index] if result_index < len(results) else None
+                item = batch_data[data_idx]
+                try:
+                    parsed = extract_json(res['text']) if res and not res.get('error') else {}
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    parsed = {}
+                    if res is not None:
+                        res['error'] = f'invalid judge JSON: {exc}'
+                if valid_judge_result(parsed):
+                    item[result_key] = parsed
+                    item.pop(error_key, None)
+                else:
+                    item.pop(result_key, None)
+                    item[error_key] = (res or {}).get('error', 'invalid judge JSON')
+                    if profile_timing:
+                        raw_text = str((res or {}).get('text') or '')
+                        logging.warning(
+                            "PERF_INVALID_JUDGE %s",
+                            json.dumps({
+                                'view': result_key,
+                                'sample_index': data_idx,
+                                'error': item[error_key],
+                                'usage': (res or {}).get('usage') or {},
+                                'text_length': len(raw_text),
+                                'text_tail': raw_text[-160:],
+                            }, ensure_ascii=False, sort_keys=True),
+                        )
 
         vlm_res_idx = 0
-
-        # --- 处理 w_gt 结果 ---
         if vlm_judge_w_gt_requests:
-            w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-            for i, res in enumerate(w_gt_results):
-                if i >= len(w_gt_request_to_index):
-                    break
-                _, data_idx = w_gt_request_to_index[i]
-                item = batch_data[data_idx]
-                item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
+            w_gt_results = (
+                vlm_results[vlm_res_idx]
+                if not isinstance(vlm_results[vlm_res_idx], Exception)
+                else []
+            )
+            apply_view_results(
+                w_gt_results,
+                w_gt_request_to_index,
+                'vlm_judge_w_gt_result',
+                'vlm_judge_w_gt_error',
+            )
             vlm_res_idx += 1
-
-        # --- 处理 wo_gt 结果 ---
         if vlm_judge_wo_gt_requests:
-            wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-            for i, res in enumerate(wo_gt_results):
-                if i >= len(wo_gt_request_to_index):
-                    break
-                _, data_idx = wo_gt_request_to_index[i]
-                item = batch_data[data_idx]
-                item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
+            wo_gt_results = (
+                vlm_results[vlm_res_idx]
+                if vlm_res_idx < len(vlm_results)
+                and not isinstance(vlm_results[vlm_res_idx], Exception)
+                else []
+            )
+            apply_view_results(
+                wo_gt_results,
+                wo_gt_request_to_index,
+                'vlm_judge_wo_gt_result',
+                'vlm_judge_wo_gt_error',
+            )
+
+        # Invalid/truncated JSON used to survive until a later full rerun.
+        # Retry only the failed view immediately, with a slightly larger
+        # completion budget, while retaining the already-valid counterpart.
+        parse_retries = max(0, int(os.environ.get('MEDGEN_JUDGE_PARSE_RETRIES', '2')))
+        retry_max_tokens = max(
+            int(os.environ.get('MEDGEN_JUDGE_MAX_TOKENS', '768')),
+            int(os.environ.get('MEDGEN_JUDGE_RETRY_MAX_TOKENS', '1024')),
+        )
+        retry_temperature = float(os.environ.get('MEDGEN_JUDGE_RETRY_TEMPERATURE', '0.1'))
+        for _retry_attempt in range(parse_retries):
+            retry_w_indices = [
+                index
+                for index, (_, data_idx) in enumerate(w_gt_request_to_index)
+                if not valid_judge_result(batch_data[data_idx].get('vlm_judge_w_gt_result'))
+            ]
+            retry_wo_indices = [
+                index
+                for index, (_, data_idx) in enumerate(wo_gt_request_to_index)
+                if not valid_judge_result(batch_data[data_idx].get('vlm_judge_wo_gt_result'))
+            ]
+            if not retry_w_indices and not retry_wo_indices:
+                break
+
+            retry_tasks = []
+            retry_specs = []
+            if retry_w_indices:
+                requests = [
+                    (
+                        *vlm_judge_w_gt_requests[index][:5],
+                        retry_temperature,
+                        retry_max_tokens,
+                    )
+                    for index in retry_w_indices
+                ]
+                retry_tasks.append(vlm_client.generate_batch(requests, concurrency=judge_concurrency))
+                retry_specs.append(('w_gt', retry_w_indices))
+            if retry_wo_indices:
+                requests = [
+                    (
+                        *vlm_judge_wo_gt_requests[index][:5],
+                        retry_temperature,
+                        retry_max_tokens,
+                    )
+                    for index in retry_wo_indices
+                ]
+                retry_tasks.append(vlm_client.generate_batch(requests, concurrency=judge_concurrency))
+                retry_specs.append(('wo_gt', retry_wo_indices))
+
+            retry_groups = await asyncio.gather(*retry_tasks, return_exceptions=True)
+            judge_seconds = time.perf_counter() - judge_started
+            all_vlm_result_groups.extend(retry_groups)
+            for (view_name, request_indices), retry_group in zip(retry_specs, retry_groups):
+                if isinstance(retry_group, Exception):
+                    retry_group = []
+                if view_name == 'w_gt':
+                    apply_view_results(
+                        retry_group,
+                        [w_gt_request_to_index[index] for index in request_indices],
+                        'vlm_judge_w_gt_result',
+                        'vlm_judge_w_gt_error',
+                    )
+                else:
+                    apply_view_results(
+                        retry_group,
+                        [wo_gt_request_to_index[index] for index in request_indices],
+                        'vlm_judge_wo_gt_result',
+                        'vlm_judge_wo_gt_error',
+                    )
 
 
-        # # --- 为每类请求分别维护索引映射 ---
-        # w_gt_request_to_index = []
-        # wo_gt_request_to_index = []
 
-        # # 假设 request_to_index 里原来是混合的，可以这样拆分：
-        # # 这里假设前 len(vlm_judge_w_gt_requests) 个是 w_gt，其余是 wo_gt
-        # w_gt_request_to_index = request_to_index[:len(vlm_judge_w_gt_requests)]
-        # wo_gt_request_to_index = request_to_index[len(vlm_judge_w_gt_requests):]
-
-        # # --- 执行 VLM Judge ---
-        # vlm_tasks = []
-        # if vlm_judge_w_gt_requests:
-        #     vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
-        # if vlm_judge_wo_gt_requests:
-        #     vlm_tasks.append(vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=8))
-
-        # vlm_results = await asyncio.gather(*vlm_tasks, return_exceptions=True) if vlm_tasks else []
-
-        # vlm_res_idx = 0
-
-        # # --- 处理 w_gt ---
-        # if vlm_judge_w_gt_requests:
-        #     w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(w_gt_results):
-        #         if i >= len(w_gt_request_to_index):  # 安全保护
-        #             break
-        #         _, data_idx = w_gt_request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #     vlm_res_idx += 1
-
-        # # --- 处理 wo_gt ---
-        # if vlm_judge_wo_gt_requests:
-        #     wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(wo_gt_results):
-        #         if i >= len(wo_gt_request_to_index):  # 安全保护
-        #             break
-        #         _, data_idx = wo_gt_request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-
-
-        # # --- 执行并保存VLM Judge结果 ---
-        # print("len(vlm_judge_w_gt_requests):", len(vlm_judge_w_gt_requests))
-        # print("len(vlm_judge_wo_gt_requests):", len(vlm_judge_wo_gt_requests))
-        # print("len(request_to_index):", len(request_to_index))
-
-
-        # # --- 执行并保存VLM Judge结果 ---
-        # vlm_tasks = []
-        # if vlm_judge_w_gt_requests: vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
-        # if vlm_judge_wo_gt_requests: vlm_tasks.append(vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=8))
-        # vlm_results = await asyncio.gather(*vlm_tasks, return_exceptions=True) if vlm_tasks else []
-
-        # vlm_res_idx = 0
-
-        # # --- 处理 w_gt ---
-        # if vlm_judge_w_gt_requests:
-        #     w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(w_gt_results):
-        #         if i >= len(request_to_index):  # 安全保护
-        #             break
-        #         _, data_idx = request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #     vlm_res_idx += 1
-
-        # # --- 处理 wo_gt ---
-        # if vlm_judge_wo_gt_requests:
-        #     wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(wo_gt_results):
-        #         if i >= len(request_to_index):  # 同样防止越界
-        #             break
-        #         _, data_idx = request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-
-
-        # vlm_res_idx, request_ptr = 0, 0
-        # if vlm_judge_w_gt_requests:
-        #     w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for res in w_gt_results:
-        #         _, data_idx = request_to_index[request_ptr]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #         request_ptr += 1
-        #     vlm_res_idx += 1
-        
-        # if vlm_judge_wo_gt_requests:
-        #     wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for res in wo_gt_results:
-        #         _, data_idx = request_to_index[request_ptr]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #         request_ptr += 1
-
-        # --- 聚合新批次的VLM指标并更新用于保存的字典 ---
+        # --- Aggregate VLM metrics for the new batch and update the checkpoint dictionary ---
         for item in batch_data:
-            if not run_vlm_judge:
+            if local_metrics_are_complete(
+                item, task, require_radgraph=enable_radgraph
+            ):
                 item['_local_metrics_complete'] = True
-            # 聚合VLM指标
-            judge_w_gt = item.get('vlm_judge_w_gt_result', {})
-            judge_wo_gt = item.get('vlm_judge_wo_gt_result', {})
-            if judge_w_gt:
-                if task == 'multimodal_generation':
-                    all_metrics['VLM_Coherence_W_GT'].append(judge_w_gt.get('coherence', {}).get('score', 0))
-                    all_metrics['VLM_Visual_Textual_Alignment_W_GT'].append(judge_w_gt.get('visual_textual_alignment', {}).get('score', 0))
-                all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
-                all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-                all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
-                append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_W_GT', judge_w_gt.get('anatomical_accuracy', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_W_GT', judge_w_gt.get('clinical_finding_accuracy', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Instruction_Compliance_W_GT', judge_w_gt.get('instruction_compliance', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_W_GT', judge_w_gt.get('cross_modal_consistency', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_W_GT', judge_w_gt.get('hallucination_omission_control', {}).get('score'))
-                all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
-            if judge_wo_gt:
-                if task == 'multimodal_generation':
-                    all_metrics['VLM_Coherence_WO_GT'].append(judge_wo_gt.get('coherence', {}).get('score', 0))
-                    all_metrics['VLM_Visual_Textual_Alignment_WO_GT'].append(judge_wo_gt.get('visual_textual_alignment', {}).get('score', 0))
-                all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
-                all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-                all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
-                append_metric_value(all_metrics, 'VLM_Anatomical_Accuracy_WO_GT', judge_wo_gt.get('anatomical_accuracy', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Clinical_Finding_Accuracy_WO_GT', judge_wo_gt.get('clinical_finding_accuracy', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Instruction_Compliance_WO_GT', judge_wo_gt.get('instruction_compliance', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Cross_Modal_Consistency_WO_GT', judge_wo_gt.get('cross_modal_consistency', {}).get('score'))
-                append_metric_value(all_metrics, 'VLM_Hallucination_Omission_Control_WO_GT', judge_wo_gt.get('hallucination_omission_control', {}).get('score'))
-                all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
+                item['_local_metrics_version'] = LOCAL_METRICS_VERSION
+                item['_radgraph_disabled'] = not enable_radgraph
+            else:
+                item.pop('_local_metrics_complete', None)
+                item.pop('_local_metrics_version', None)
+            # Aggregate VLM metrics.
+            append_judge_metrics(all_metrics, item.get('vlm_judge_w_gt_result'), 'W_GT')
+            append_judge_metrics(all_metrics, item.get('vlm_judge_wo_gt_result'), 'WO_GT')
 
-            # 更新用于保存的字典（现在item包含了所有指标）
+            # Update the checkpoint dictionary; item now contains all metrics.
             uid = generate_sample_id(item)
             full_results_dict[uid] = item
 
-        # --- 5. 每次处理完批次后，覆盖写入包含所有指标的完整中间文件 ---
-        with open(intermediate_file, 'w', encoding='utf-8') as f:
-            for item in full_results_dict.values():
-                f.write(json.dumps(item, ensure_ascii=False) + '\n')
+        # --- 5. Append only this batch to a recovery journal.  Rewriting the
+        # entire multi-thousand-row checkpoint every four samples caused
+        # quadratic I/O.  The loader applies last-write-wins by sample id, and
+        # the journal is atomically compacted into the canonical file at end.
+        checkpoint_started = time.perf_counter()
+        with open(journal_file, 'a', encoding='utf-8') as journal:
+            for item in batch_data:
+                journal.write(json.dumps(item, ensure_ascii=False) + '\n')
+        checkpoint_seconds = time.perf_counter() - checkpoint_started
 
-    # --- 6. 聚合最终结果 (all_metrics 已包含所有样本的数据) ---
+        if profile_timing:
+            flat_vlm_results = [
+                result
+                for result_group in all_vlm_result_groups
+                if isinstance(result_group, list)
+                for result in result_group
+                if isinstance(result, dict)
+            ]
+            prompt_tokens = sum(
+                int((result.get('usage') or {}).get('prompt_tokens') or 0)
+                for result in flat_vlm_results
+            )
+            completion_tokens = sum(
+                int((result.get('usage') or {}).get('completion_tokens') or 0)
+                for result in flat_vlm_results
+            )
+            complete_items = sum(
+                judge_result_is_complete(item, task) if run_vlm_judge else bool(item.get('_local_metrics_complete'))
+                for item in batch_data
+            )
+            logging.info(
+                "PERF_BATCH %s",
+                json.dumps({
+                    'batch': batch_number,
+                    'batch_size': len(batch_data),
+                    'prepare_seconds': prepare_seconds,
+                    'local_metrics_seconds': local_metrics_seconds,
+                    'judge_seconds': judge_seconds,
+                    'checkpoint_seconds': checkpoint_seconds,
+                    'total_seconds': time.perf_counter() - batch_started,
+                    'judge_requests': len(flat_vlm_results),
+                    'prompt_tokens': prompt_tokens,
+                    'completion_tokens': completion_tokens,
+                    'complete_items': int(complete_items),
+                }, sort_keys=True),
+            )
+
+    compact_path = intermediate_file + f'.compact.{os.getpid()}'
+    with open(compact_path, 'w', encoding='utf-8') as compacted:
+        for item in full_results_dict.values():
+            compacted.write(json.dumps(item, ensure_ascii=False) + '\n')
+    os.replace(compact_path, intermediate_file)
+    if os.path.exists(journal_file):
+        os.remove(journal_file)
+
+    # --- 6. Aggregate final results; all_metrics includes all sample data ---
     final_results = {}
     for metric, values in all_metrics.items():
-        if values:
-            mean_val = float(np.mean(values))
-            std_val = float(np.std(values))  # 计算标准差
+        finite_values = [value for value in values if isinstance(value, (int, float)) and np.isfinite(value)]
+        if finite_values:
+            mean_val = float(np.mean(finite_values))
+            std_val = float(np.std(finite_values))  # Calculate standard deviation
             final_results[f"Average_{metric}"] = mean_val
-            final_results[f"Std_{metric}"] = std_val  # 保存标准差
-            ci = bootstrap_ci(values, n_boot=n_boot)
+            final_results[f"Std_{metric}"] = std_val  # Save standard deviation
+            ci = bootstrap_ci(finite_values, n_boot=n_boot)
             if ci['mean'] is not None:
                 final_results[f"Bootstrap95CI_Low_{metric}"] = ci['ci_low']
                 final_results[f"Bootstrap95CI_High_{metric}"] = ci['ci_high']
 
-            # 如果想打印出来
+            # Optionally print the result.
             print(f"{metric}: mean={mean_val:.4f}, std={std_val:.4f}")
 
-    accuracy_rates = calculate_accuracy_rates(all_metrics)
+    accuracy_rates = calculate_accuracy_rates({
+        metric: [value for value in values if isinstance(value, (int, float)) and np.isfinite(value)]
+        for metric, values in all_metrics.items()
+    })
     final_results.update(accuracy_rates)
     if text_metric_sample_count:
         final_results['RadGraph_Coverage'] = radgraph_applicable_count / text_metric_sample_count
     final_results['Error_Analysis'] = build_error_analysis(full_results_dict, task)
     final_results['Task_Coverage'] = task_coverage(data)
 
-    logging.info(f"评估完成。包含所有指标的中间结果已保存至: {intermediate_file}")
+    logging.info(f"Evaluation complete. Checkpoint with all metrics saved to: {intermediate_file}")
     return final_results
 
 async def basic_eval_for_type_wise(
@@ -1318,7 +1310,7 @@ async def basic_eval_for_type_wise(
     judge_config: str = './api/config.vllm.yaml',
 ) -> dict:
     """
-    对给定的数据集子集执行基础评估，并支持所有指标（图片、文本、VLM）的断点续评。
+    Run basic evaluation for a dataset subset with checkpoint/resume support for image, text, and VLM metrics.
     """
     for item in data:
         validate_paper_task(paper_task_for_item(item))
@@ -1329,14 +1321,14 @@ async def basic_eval_for_type_wise(
     base_name = os.path.basename(jsonl_path)
     name, ext = os.path.splitext(base_name)
 
-    # 去掉第一个 "_" 之前（含 "_"）的内容
+    # Remove the prefix through the first underscore.
     if "_" in name:
         name = name.split("_", 1)[1]
 
     output_root = os.path.join("./eval_results_type_wise", name)
     os.makedirs(output_root, exist_ok=True)
 
-    # --- 1. 构建并加载中间结果 ---
+    # --- 1. Build and load checkpoint results ---
     eval_results_dir = output_root
     os.makedirs(eval_results_dir, exist_ok=True)
     print(eval_results_dir)
@@ -1349,90 +1341,64 @@ async def basic_eval_for_type_wise(
         with open(intermediate_file, 'r', encoding='utf-8') as f:
             for line in f:
                 item = json.loads(line)
-                # 使用 item 的部分内容生成唯一ID
+                # Use selected item content to generate a unique ID.
                 uid = generate_sample_id(item)
                 existing_data[uid] = item
-        logging.info(f"检测到中间结果文件，已加载 {len(existing_data)} 条已评测样本。")
+        logging.info(f"Found checkpoint file; loaded {len(existing_data)} evaluated samples.")
 
-    # --- 2. 区分已处理和未处理的样本 ---
+    # --- 2. Separate processed and unprocessed samples ---
     unprocessed_items = []
     already_processed_items = []
     for item in data:
         uid = generate_sample_id(item)
-        if uid in existing_data and 'vlm_judge_w_gt_result' in existing_data[uid]: # 确保核心评测已完成
-            # 使用已加载的、带有所有指标的完整数据
+        if uid in existing_data and 'vlm_judge_w_gt_result' in existing_data[uid]: # Ensure the core evaluation is complete.
+            # Use the loaded complete record with all metrics.
             already_processed_items.append(existing_data[uid])
         else:
             unprocessed_items.append(item)
 
-    # --- 3. 预加载所有已处理样本的指标（图片、文本、VLM） ---
-    logging.info(f"发现 {len(already_processed_items)} 条已完整处理的样本，将直接加载其所有结果。")
+    # --- 3. Preload metrics for all processed samples (image, text, and VLM) ---
+    logging.info(f"Found {len(already_processed_items)} fully processed samples; loading their results directly.")
     for item in already_processed_items:
-        # 加载图片和文本指标
+        # Load image and text metrics.
         for metric_key in [
-            'Anatomical_Embedding_Similarity',
-            'BLEU', 'BERT_Score',
-            'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
-            'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
-            'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
-            'Task_Accuracy', 'Text_EM', 'Text_F1'
+            'LPIPS', 'PSNR', 'SSIM', 'MedImageInsight_Similarity',
+            'BLEU', 'BERT_Score', 'RadGraph_F1', 'Text_EM',
         ]:
-            if metric_key in item:
-                all_metrics[metric_key].append(item[metric_key])
+            append_metric_value(all_metrics, metric_key, item.get(metric_key))
 
-        # 加载VLM Judge指标
+        # Load VLM judge metrics.
         judge_w_gt = item.get('vlm_judge_w_gt_result')
         judge_wo_gt = item.get('vlm_judge_wo_gt_result')
 
-        if judge_w_gt:
-            if task == 'multimodal_generation':
-                all_metrics['VLM_Coherence_W_GT'].append(judge_w_gt.get('coherence', {}).get('score', 0))
-                all_metrics['VLM_Visual_Textual_Alignment_W_GT'].append(judge_w_gt.get('visual_textual_alignment', {}).get('score', 0))
-            all_metrics['VLM_Content_Accuracy_W_GT'].append(judge_w_gt.get('content_accuracy', {}).get('score', 0))
-            all_metrics['VLM_Relevance_W_GT'].append(judge_w_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-            all_metrics['VLM_Consistency_W_GT'].append(judge_w_gt.get('consistency', {}).get('score', 0))
-            all_metrics['VLM_Overall_Score_W_GT'].append(judge_w_gt.get('overall_score', 0))
+        append_judge_metrics(all_metrics, judge_w_gt, 'W_GT')
+        append_judge_metrics(all_metrics, judge_wo_gt, 'WO_GT')
 
-        if judge_wo_gt:
-            if task == 'multimodal_generation':
-                all_metrics['VLM_Coherence_WO_GT'].append(judge_wo_gt.get('coherence', {}).get('score', 0))
-                all_metrics['VLM_Visual_Textual_Alignment_WO_GT'].append(judge_wo_gt.get('visual_textual_alignment', {}).get('score', 0))
-            all_metrics['VLM_Content_Accuracy_WO_GT'].append(judge_wo_gt.get('content_accuracy', {}).get('score', 0))
-            all_metrics['VLM_Relevance_WO_GT'].append(judge_wo_gt.get('relevance_and_responsiveness', {}).get('score', 0))
-            all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
-            all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
-
-    # --- 按任务生成结构化检查清单 judge prompt ---
+    # --- Build a task-specific structured checklist prompt ---
     current_vlm_holistic_judge_w_gt_prompt = build_vlm_judge_prompt(task, with_gt=True)
     current_vlm_holistic_judge_wo_gt_prompt = build_vlm_judge_prompt(task, with_gt=False)
 
-    # 完整结果字典，用于每次覆盖写入
+    # Complete result dictionary for checkpoint overwrites.
     full_results_dict = dict(existing_data)
 
-    # --- 4. 只对未处理的样本进行迭代和评估 ---
-    # if not unprocessed_items:
-    #     logging.info("所有样本均已处理完毕，无需执行新的评估。")
-    # else:
-    #     logging.info(f"开始处理 {len(unprocessed_items)} 条新样本。")
-
     if not unprocessed_items:
-        logging.info("所有样本均已处理完毕，无需执行新的评估。")
+        logging.info("All samples are already processed; no new evaluation is required.")
     else:
-        logging.warning(f"检测到 {len(unprocessed_items)} 条未处理样本，但选择跳过它们，直接计算已有结果。")
-        unprocessed_items = []  # 强制清空，跳过后续评估流程
+        logging.warning(f"Detected {len(unprocessed_items)} unprocessed samples, but skipping them and computing only existing results.")
+        unprocessed_items = []  # Clear this list to skip further evaluation.
 
     total_batches = (len(unprocessed_items) + batch_size - 1) // batch_size
     for i in tqdm(range(0, len(unprocessed_items), batch_size), desc="Evaluating Batches", total=total_batches):
         batch_data = unprocessed_items[i:i+batch_size]
 
-        # --- 准备异步任务 (这部分逻辑和原来一致) ---
+        # --- Prepare asynchronous tasks. ---
         vlm_judge_w_gt_requests, vlm_judge_wo_gt_requests = [], []
         request_to_index = []
         eval_images, ref_images = [], []
         eval_texts, ref_texts = [], []
 
         for idx, item in enumerate(batch_data):
-            # ... (准备图像/文本/VLM请求的逻辑保持不变)
+            # ... (Prepare image, text, and VLM requests.)
             if task in ['multimodal_generation', 'image_edit']:
                 try:
                     eval_images.append(
@@ -1444,11 +1410,11 @@ async def basic_eval_for_type_wise(
                         ).convert('RGB')
                     )
                 except (FileNotFoundError, IOError) as e:
-                    logging.warning(f"无法加载图片，跳过图像指标计算: {e}")
+                    logging.warning(f"Could not load image; skipping image-metric calculation: {e}")
             if task in ['multimodal_generation', 'vqa']:
                 eval_texts.append(item.get('response', ''))
                 ref_texts.append(item.get('answer', ''))
-            # ... (VLM请求准备逻辑保持不变)
+            # ... (Prepare VLM requests.)
             w_gt_prompt = "\n".join([
                 current_vlm_holistic_judge_w_gt_prompt[0], current_vlm_holistic_judge_w_gt_prompt[1],
                 current_vlm_holistic_judge_w_gt_prompt[2], current_vlm_holistic_judge_w_gt_prompt[3],
@@ -1506,14 +1472,14 @@ async def basic_eval_for_type_wise(
                 request_to_index.append(('wo_gt', idx))
 
 
-        # --- 执行并保存图片和文本指标 ---
+        # --- Run and save image and text metrics ---
         metric_tasks = []
         if task in ['multimodal_generation', 'image_edit'] and eval_images:
             metric_tasks.extend([
                 batch_async_FR_IQA(eval_images, ref_images, 'lpips'),
                 batch_async_FR_IQA(eval_images, ref_images, 'psnr'),
                 batch_async_FR_IQA(eval_images, ref_images, 'ssim'),
-                batch_async_anatomical_metrics(eval_images, ref_images),
+                batch_async_medimageinsight_metrics(eval_images, ref_images),
             ])
         if task in ['multimodal_generation', 'vqa'] and eval_texts:
             metric_tasks.extend([
@@ -1546,33 +1512,28 @@ async def basic_eval_for_type_wise(
                 scores = metric_results[res_idx]
                                
                 if scores is None:
-                    print(f"[WARN] metric {metric_name} 返回 None，跳过该条数据。")
+                    print(f"[WARN] metric {metric_name} returned None; skipping this record.")
                     res_idx += 1
                     continue
                                
                 if not isinstance(scores, Exception):
                     all_metrics[metric_name].extend(scores)
-                    # 【核心修改】将指标保存回每个样本中
+                    # Save metrics back to each sample.
                     for item_idx, score in enumerate(scores):
                         batch_data[item_idx][metric_name] = score
                 else:
                     raise RuntimeError(f"{metric_name} failed; evaluation aborted") from scores
                 res_idx += 1
 
-        # # --- 打印调试信息 ---
-        # print("len(vlm_judge_w_gt_requests):", len(vlm_judge_w_gt_requests))
-        # print("len(vlm_judge_wo_gt_requests):", len(vlm_judge_wo_gt_requests))
-        # print("len(request_to_index):", len(request_to_index))
-
-        # --- 为每类请求分别维护索引映射 ---
+        # --- Maintain an index mapping for each request type ---
         w_gt_request_to_index = []
         wo_gt_request_to_index = []
 
-        # 拆分 request_to_index
+        # Split request_to_index.
         w_gt_request_to_index = [x for x in request_to_index if x[0] == 'w_gt']
         wo_gt_request_to_index = [x for x in request_to_index if x[0] == 'wo_gt']
 
-        # --- 执行 VLM Judge ---
+        # --- Run the VLM judge ---
         vlm_tasks = []
         if vlm_judge_w_gt_requests:
             vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
@@ -1583,7 +1544,7 @@ async def basic_eval_for_type_wise(
 
         vlm_res_idx = 0
 
-        # --- 处理 w_gt 结果 ---
+        # --- Process w_gt results ---
         if vlm_judge_w_gt_requests:
             w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
             for i, res in enumerate(w_gt_results):
@@ -1594,7 +1555,7 @@ async def basic_eval_for_type_wise(
                 item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
             vlm_res_idx += 1
 
-        # --- 处理 wo_gt 结果 ---
+        # --- Process wo_gt results ---
         if vlm_judge_wo_gt_requests:
             wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
             for i, res in enumerate(wo_gt_results):
@@ -1605,105 +1566,12 @@ async def basic_eval_for_type_wise(
                 item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
 
 
-        # # --- 为每类请求分别维护索引映射 ---
-        # w_gt_request_to_index = []
-        # wo_gt_request_to_index = []
-
-        # # 假设 request_to_index 里原来是混合的，可以这样拆分：
-        # # 这里假设前 len(vlm_judge_w_gt_requests) 个是 w_gt，其余是 wo_gt
-        # w_gt_request_to_index = request_to_index[:len(vlm_judge_w_gt_requests)]
-        # wo_gt_request_to_index = request_to_index[len(vlm_judge_w_gt_requests):]
-
-        # # --- 执行 VLM Judge ---
-        # vlm_tasks = []
-        # if vlm_judge_w_gt_requests:
-        #     vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
-        # if vlm_judge_wo_gt_requests:
-        #     vlm_tasks.append(vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=8))
-
-        # vlm_results = await asyncio.gather(*vlm_tasks, return_exceptions=True) if vlm_tasks else []
-
-        # vlm_res_idx = 0
-
-        # # --- 处理 w_gt ---
-        # if vlm_judge_w_gt_requests:
-        #     w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(w_gt_results):
-        #         if i >= len(w_gt_request_to_index):  # 安全保护
-        #             break
-        #         _, data_idx = w_gt_request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #     vlm_res_idx += 1
-
-        # # --- 处理 wo_gt ---
-        # if vlm_judge_wo_gt_requests:
-        #     wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(wo_gt_results):
-        #         if i >= len(wo_gt_request_to_index):  # 安全保护
-        #             break
-        #         _, data_idx = wo_gt_request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-
-
-        # # --- 执行并保存VLM Judge结果 ---
-        # print("len(vlm_judge_w_gt_requests):", len(vlm_judge_w_gt_requests))
-        # print("len(vlm_judge_wo_gt_requests):", len(vlm_judge_wo_gt_requests))
-        # print("len(request_to_index):", len(request_to_index))
-
-
-        # # --- 执行并保存VLM Judge结果 ---
-        # vlm_tasks = []
-        # if vlm_judge_w_gt_requests: vlm_tasks.append(vlm_client.generate_batch(vlm_judge_w_gt_requests, concurrency=8))
-        # if vlm_judge_wo_gt_requests: vlm_tasks.append(vlm_client.generate_batch(vlm_judge_wo_gt_requests, concurrency=8))
-        # vlm_results = await asyncio.gather(*vlm_tasks, return_exceptions=True) if vlm_tasks else []
-
-        # vlm_res_idx = 0
-
-        # # --- 处理 w_gt ---
-        # if vlm_judge_w_gt_requests:
-        #     w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(w_gt_results):
-        #         if i >= len(request_to_index):  # 安全保护
-        #             break
-        #         _, data_idx = request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #     vlm_res_idx += 1
-
-        # # --- 处理 wo_gt ---
-        # if vlm_judge_wo_gt_requests:
-        #     wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for i, res in enumerate(wo_gt_results):
-        #         if i >= len(request_to_index):  # 同样防止越界
-        #             break
-        #         _, data_idx = request_to_index[i]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-
-
-        # vlm_res_idx, request_ptr = 0, 0
-        # if vlm_judge_w_gt_requests:
-        #     w_gt_results = vlm_results[vlm_res_idx] if not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for res in w_gt_results:
-        #         _, data_idx = request_to_index[request_ptr]
-        #         item = batch_data[data_idx]
-        #         item['vlm_judge_w_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
-        #         request_ptr += 1
-        #     vlm_res_idx += 1
-        
-        # if vlm_judge_wo_gt_requests:
-        #     wo_gt_results = vlm_results[vlm_res_idx] if vlm_res_idx < len(vlm_results) and not isinstance(vlm_results[vlm_res_idx], Exception) else []
-        #     for res in wo_gt_results:
-        #         _, data_idx = request_to_index[request_ptr]
-        #         item = batch_data[data_idx]
         #         item['vlm_judge_wo_gt_result'] = extract_json(res['text']) if res and not res.get('error') else {}
         #         request_ptr += 1
 
-        # --- 聚合新批次的VLM指标并更新用于保存的字典 ---
+        # --- Aggregate VLM metrics for the new batch and update the checkpoint dictionary ---
         for item in batch_data:
-            # 聚合VLM指标
+            # Aggregate VLM metrics.
             judge_w_gt = item.get('vlm_judge_w_gt_result', {})
             judge_wo_gt = item.get('vlm_judge_wo_gt_result', {})
             if judge_w_gt:
@@ -1723,31 +1591,31 @@ async def basic_eval_for_type_wise(
                 all_metrics['VLM_Consistency_WO_GT'].append(judge_wo_gt.get('consistency', {}).get('score', 0))
                 all_metrics['VLM_Overall_Score_WO_GT'].append(judge_wo_gt.get('overall_score', 0))
 
-            # 更新用于保存的字典（现在item包含了所有指标）
+            # Update the checkpoint dictionary; item now contains all metrics.
             uid = generate_sample_id(item)
             full_results_dict[uid] = item
 
-        # --- 5. 每次处理完批次后，覆盖写入包含所有指标的完整中间文件 ---
+        # --- 5. After each batch, overwrite the complete checkpoint containing all metrics ---
         with open(intermediate_file, 'w', encoding='utf-8') as f:
             for item in full_results_dict.values():
                 f.write(json.dumps(item, ensure_ascii=False) + '\n')
 
-    # --- 6. 聚合最终结果 (all_metrics 已包含所有样本的数据) ---
+    # --- 6. Aggregate final results; all_metrics includes all sample data ---
     final_results = {}
     for metric, values in all_metrics.items():
         if values:
             mean_val = float(np.mean(values))
-            std_val = float(np.std(values))  # 计算标准差
+            std_val = float(np.std(values))  # Calculate standard deviation
             final_results[f"Average_{metric}"] = mean_val
-            final_results[f"Std_{metric}"] = std_val  # 保存标准差
+            final_results[f"Std_{metric}"] = std_val  # Save standard deviation
 
-            # 如果想打印出来
+            # Optionally print the result.
             print(f"{metric}: mean={mean_val:.4f}, std={std_val:.4f}")
 
     accuracy_rates = calculate_accuracy_rates(all_metrics)
     final_results.update(accuracy_rates)
 
-    logging.info(f"评估完成。包含所有指标的中间结果已保存至: {intermediate_file}")
+    logging.info(f"Evaluation complete. Checkpoint with all metrics saved to: {intermediate_file}")
     return final_results
 
 
@@ -1758,25 +1626,25 @@ async def eval_type_wise(data: list, batch_size: int, type_key: str, task: str, 
         grouped_data[modality_type].append(item)
     
     # ============================================================
-    # 🔥 在最后一个循环之前加入你的“modality 划分 vlm_jsonl 文件”的代码
+    # 🔥 Write a modality-split VLM JSONL file before the final loop
     # ============================================================
     import json
 
-    # 原文件：xxx.jsonl
+    # Source file: xxx.jsonl
     base_name = os.path.basename(jsonl_path)
     name, ext = os.path.splitext(base_name)
 
     output_root = os.path.join("./eval_results_type_wise", name)
     os.makedirs(output_root, exist_ok=True)
 
-    # 生成 xxx_with_vlm.jsonl
+    # Generate xxx_with_vlm.jsonl
     vlm_jsonl_path = os.path.join("./eval_results", f"{name}_with_vlm{ext}")
 
-    # 如果文件存在才处理（避免异常）
+    # Process only when the file exists.
     if os.path.exists(vlm_jsonl_path):
         modality_buckets = defaultdict(list)
 
-        # 读取 vlm_jsonl_path 的全部条目
+        # Read all entries from vlm_jsonl_path.
         with open(vlm_jsonl_path, "r", encoding="utf-8") as f:
             for line in f:
                 try:
@@ -1786,7 +1654,7 @@ async def eval_type_wise(data: list, batch_size: int, type_key: str, task: str, 
                 except json.JSONDecodeError:
                     continue
 
-        # 逐 modality 写文件
+        # Write one file per modality.
         for modality, items in modality_buckets.items():
             out_path = os.path.join(
                 output_root,
@@ -1796,78 +1664,27 @@ async def eval_type_wise(data: list, batch_size: int, type_key: str, task: str, 
                 for obj in items:
                     fw.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-            logging.info(f"[VLM SPLIT] {modality}: {len(items)} 条 → {out_path}")
+            logging.info(f"[VLM SPLIT] {modality}: {len(items)} records -> {out_path}")
     else:
-        raise FileNotFoundError(f"[VLM SPLIT ERROR] 未找到文件: {vlm_jsonl_path}")
+        raise FileNotFoundError(f"[VLM SPLIT ERROR] File not found: {vlm_jsonl_path}")
 
 
 
     all_results = {}
     for modality_type, subset_data in grouped_data.items():
-        logging.info(f"开始评估类型: '{modality_type}' (包含 {len(subset_data)} 个样本)")
-        # 为每个子类生成独立的中间文件名（避免冲突）
+        logging.info(f"Evaluating group '{modality_type}' ({len(subset_data)} samples)")
+        # Create a distinct checkpoint filename for each group.
         subset_jsonl_path = os.path.join(output_root, f"{modality_type}_{os.path.basename(jsonl_path)}")
         all_results[modality_type] = await basic_eval_for_type_wise(subset_data, batch_size, task, data_path, subset_jsonl_path, judge_config)
         print(all_results)
-        # all_results[modality_type] = await basic_eval(subset_data, batch_size, task, data_path, subset_jsonl_path)
     
 
     return all_results
-    # tasks = []             # 保存 (subset_data, subset_jsonl_path)
-    # modality_types = []    # 保存 modality_type
-
-    # # ---- 第 1 个循环：写文件，来源改为 _with_vlm.jsonl ----
-    # # vlm_jsonl_path = f"./eval_results/{os.path.basename(jsonl_path)}_with_vlm.jsonl"
-    # base_name = os.path.basename(jsonl_path)
-    # name, ext = os.path.splitext(base_name)  # 分离文件名和扩展名
-    # vlm_jsonl_path = os.path.join("./eval_results", f"{name}_with_vlm{ext}")
-
-    # logging.info(f"读取带 VLM 的文件：{vlm_jsonl_path}")
-
-    # # 读取完整数据
-    # full_data = []
-    # with open(vlm_jsonl_path, 'r', encoding='utf-8') as f:
-    #     for line in f:
-    #         full_data.append(json.loads(line))
-
-    # # 按 modality 分组
-    # grouped_data_with_vlm = defaultdict(list)
-    # for entry in full_data:
-    #     modality = entry.get("modality", "Unknown")
-    #     grouped_data_with_vlm[modality].append(entry)
-
-    # # 写入每种 modality 的 jsonl
-    # for modality_type, modality_entries in grouped_data_with_vlm.items():
-    #     logging.info(f"准备类型 '{modality_type}'，共 {len(modality_entries)} 条")
-
-    #     subset_jsonl_path = os.path.join(
-    #         './eval_results_type_wise',
-    #         f"{modality_type}_{os.path.basename(jsonl_path)}"
-    #     )
-
-    #     # 创建并写入 jsonl（覆盖写入）
-    #     with open(subset_jsonl_path, 'w', encoding='utf-8') as f:
-    #         for entry in modality_entries:
-    #             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-    #     logging.info(f"写入完成：{subset_jsonl_path}")
-
-    #     # 记录任务信息（第二个循环仍使用原来的 subset_data）
-    #     tasks.append((subset_data, subset_jsonl_path))
-    #     modality_types.append(modality_type)
-
-    # # -------- 第 2 个循环：统一执行评估 basic_eval_for_type_wise --------
-    # for modality_type, (subset_data, subset_jsonl_path) in zip(modality_types, tasks):
-    #     logging.info(f"开始评估类型: '{modality_type}'")
-    #     all_results[modality_type] = await basic_eval_for_type_wise(
-    #         subset_data, batch_size, task, data_path, subset_jsonl_path
-    #     )
-
 
 
 def save_results(results: dict, jsonl_path: str, task: str):
-    """将评估结果保存到json文件"""
-    output_dir = './eval_results'
+    """Save evaluation results to a JSON file."""
+    output_dir = os.environ.get('MEDGEN_EVAL_RESULTS_DIR', './eval_results')
     os.makedirs(output_dir, exist_ok=True)
     
     base_name = os.path.basename(jsonl_path)
@@ -1877,10 +1694,10 @@ def save_results(results: dict, jsonl_path: str, task: str):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4)
         
-    logging.info(f"评估结果已成功保存到: {output_path}")
+    logging.info(f"Evaluation results saved to: {output_path}")
 
 def save_results_for_type_wise(results: dict, jsonl_path: str, task: str):
-    """将评估结果保存到json文件"""
+    """Save evaluation results to a JSON file."""
     output_dir = './eval_results_type_wise'
     os.makedirs(output_dir, exist_ok=True)
     
@@ -1891,7 +1708,7 @@ def save_results_for_type_wise(results: dict, jsonl_path: str, task: str):
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(results, f, indent=4)
         
-    logging.info(f"评估结果已成功保存到: {output_path}")
+    logging.info(f"Evaluation results saved to: {output_path}")
 
 
 def metrics_from_record(item: dict, task: str) -> dict:
@@ -1899,12 +1716,9 @@ def metrics_from_record(item: dict, task: str) -> dict:
     metrics = {}
     for key in [
         'LPIPS', 'PSNR', 'SSIM',
-        'Anatomical_Embedding_Similarity',
+        'MedImageInsight_Similarity',
         'BLEU', 'BERT_Score',
-        'Clinical_Entity_P', 'Clinical_Entity_R', 'Clinical_Entity_F1',
-        'Entity_Hallucination_Rate', 'Entity_Omission_Rate',
-        'Entity_Factual_Precision', 'CheXbert_Factual_Precision',
-        'RadGraph_F1', 'Task_Accuracy', 'Text_EM', 'Text_F1'
+        'RadGraph_F1', 'Text_EM'
     ]:
         value = item.get(key)
         if isinstance(value, (int, float)) and np.isfinite(value):
@@ -1916,31 +1730,11 @@ def metrics_from_record(item: dict, task: str) -> dict:
     ]
     for field, suffix in judge_specs:
         judge = item.get(field)
-        if not isinstance(judge, dict) or not judge:
+        if not valid_judge_result(judge):
             continue
-        score_fields = {
-            'content_accuracy': f'VLM_Content_Accuracy_{suffix}',
-            'relevance_and_responsiveness': f'VLM_Relevance_{suffix}',
-            'consistency': f'VLM_Consistency_{suffix}',
-            'anatomical_accuracy': f'VLM_Anatomical_Accuracy_{suffix}',
-            'clinical_finding_accuracy': f'VLM_Clinical_Finding_Accuracy_{suffix}',
-            'instruction_compliance': f'VLM_Instruction_Compliance_{suffix}',
-            'cross_modal_consistency': f'VLM_Cross_Modal_Consistency_{suffix}',
-            'hallucination_omission_control': f'VLM_Hallucination_Omission_Control_{suffix}',
-        }
-        if task == 'multimodal_generation':
-            score_fields.update({
-                'coherence': f'VLM_Coherence_{suffix}',
-                'visual_textual_alignment': f'VLM_Visual_Textual_Alignment_{suffix}',
-            })
-        for source_key, metric_key in score_fields.items():
-            section = judge.get(source_key)
-            value = section.get('score') if isinstance(section, dict) else None
-            if isinstance(value, (int, float)) and np.isfinite(value):
-                metrics[metric_key] = float(value)
-        overall = judge.get('overall_score')
-        if isinstance(overall, (int, float)) and np.isfinite(overall):
-            metrics[f'VLM_Overall_Score_{suffix}'] = float(overall)
+        for source_key, metric_prefix in JUDGE_DIMENSIONS.items():
+            metrics[f'{metric_prefix}_{suffix}'] = float(judge[source_key]['score'])
+        metrics[f'VLM_Overall_Score_{suffix}'] = float(judge['overall_score'])
     return metrics
 
 
@@ -1979,15 +1773,21 @@ async def aggregate_type_wise_results(
 
         summary = {'Sample_Count': len(records), 'Task_Coverage': task_coverage(data)}
         for metric_name, values in sorted(group_metrics.items()):
-            summary[f'Average_{metric_name}'] = float(np.mean(values))
-            summary[f'Std_{metric_name}'] = float(np.std(values))
-            ci = bootstrap_ci(values, n_boot=n_boot)
+            finite_values = [value for value in values if isinstance(value, (int, float)) and np.isfinite(value)]
+            if not finite_values:
+                continue
+            summary[f'Average_{metric_name}'] = float(np.mean(finite_values))
+            summary[f'Std_{metric_name}'] = float(np.std(finite_values))
+            ci = bootstrap_ci(finite_values, n_boot=n_boot)
             if ci['mean'] is not None:
                 summary[f'Bootstrap95CI_Low_{metric_name}'] = ci['ci_low']
                 summary[f'Bootstrap95CI_High_{metric_name}'] = ci['ci_high']
         if radgraph_total:
             summary['RadGraph_Coverage'] = radgraph_applicable / radgraph_total
-        summary.update(calculate_accuracy_rates(group_metrics))
+        summary.update(calculate_accuracy_rates({
+            metric: [value for value in values if isinstance(value, (int, float)) and np.isfinite(value)]
+            for metric, values in group_metrics.items()
+        }))
         summary['Error_Analysis'] = build_error_analysis(
             {str(item.get('sample_id') or generate_sample_id(item)): item for item in records},
             task,
@@ -1999,7 +1799,7 @@ async def aggregate_type_wise_results(
         with open(group_path, 'w', encoding='utf-8') as handle:
             for item in records:
                 handle.write(json.dumps(item, ensure_ascii=False) + '\n')
-        logging.info("类型 %s: %d 条 → %s", group_name, len(records), group_path)
+        logging.info("Group %s: %d records -> %s", group_name, len(records), group_path)
     return all_results
 
 
@@ -2017,11 +1817,11 @@ async def main():
         save_results_for_stats(results, args.jsonl_path)
         return
 
-    # 加载数据
+    # Load data.
     data = load_jsonl_data(args.jsonl_path[0])
     if args.max_samples is not None:
         if args.max_samples <= 0:
-            raise ValueError('--max_samples 必须是正整数')
+            raise ValueError('--max_samples must be a positive integer')
         data = data[:args.max_samples]
     if not data:
         return
@@ -2030,29 +1830,29 @@ async def main():
         summary = validate_eval_input(data, args.task, args.data_path)
         if args.require_full_task_coverage and not summary['paper_task_coverage_complete']:
             raise ValueError(
-                '输入未覆盖全部16个论文任务，缺失: '
+                'Input does not cover all 16 paper tasks; missing: '
                 + ', '.join(summary['missing_paper_tasks'])
             )
-        print("评测输入验证通过（未加载指标模型、未调用API）:")
+        print("Evaluation input validation passed (metric models were not loaded and no API was called):")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
 
     if EVAL_DEPENDENCY_ERROR is not None:
         raise RuntimeError(
-            "缺少完整评测依赖；请按 README 安装 requirements-eval.txt"
+            "Full evaluation dependencies are missing; install requirements-eval.txt as described in the README"
         ) from EVAL_DEPENDENCY_ERROR
 
     if args.local_metrics_only and args.mission != 'basic_eval':
-        raise ValueError('--local-metrics-only 仅支持 --mission basic_eval')
+        raise ValueError('--local-metrics-only supports only --mission basic_eval')
 
     jsonl_path = args.jsonl_path[0]
     coverage = task_coverage(data)
     if args.require_full_task_coverage and not coverage['complete']:
         raise ValueError(
-            '输入未覆盖全部16个论文任务，缺失: '
+            'Input does not cover all 16 paper tasks; missing: '
             + ', '.join(coverage['missing_tasks'])
         )
-    # 执行评估
+    # Run evaluation.
     if args.mission == 'basic_eval':
         results = await basic_eval(
             data,
@@ -2065,6 +1865,7 @@ async def main():
             judge_backend=args.judge_backend,
             judge_config=args.judge_config,
             enable_clinical_text_metrics=args.enable_clinical_text_metrics,
+            enable_radgraph=not args.disable_radgraph,
             n_boot=args.bootstrap_samples,
         )
     elif args.mission == 'type_wise':
@@ -2077,10 +1878,10 @@ async def main():
             judge_config=args.judge_config,
         )
     else:
-        logging.error(f"未知的 mission: {args.mission}")
+        logging.error(f"Unknown mission: {args.mission}")
         return
 
-    # 保存结果
+    # Save results.
     if args.mission == 'type_wise':
         save_results_for_type_wise(results, jsonl_path, args.task)
     else:   

@@ -10,7 +10,7 @@ from PIL import Image
 from util.metrics import (
     compute_anatomical_embedding_similarity,
     batch_async_evaluate_text_quality,
-    batch_async_anatomical_metrics,
+    batch_async_medimageinsight_metrics,
     evaluate_text_quality,
 )
 
@@ -42,15 +42,15 @@ async def run(include_bertscore: bool) -> dict[str, float]:
         )
         assert async_bert[0] > 0.99
         scores["BERT_Score"] = async_bert[0]
-    print("Testing Rad-DINO anatomical metric...", flush=True)
-    scores.update((await batch_async_anatomical_metrics([candidate], [reference]))[0])
+    print("Testing MedImageInsight image metric...", flush=True)
+    scores.update((await batch_async_medimageinsight_metrics([candidate], [reference]))[0])
 
     async_bleu = await batch_async_evaluate_text_quality(
         ["normal chest radiograph"], ["normal chest radiograph"], "bleu"
     )
     assert len(async_bleu) == 1
     assert all(math.isfinite(value) for value in scores.values())
-    assert -1 <= scores["Anatomical_Embedding_Similarity"] <= 1
+    assert -1 <= scores["MedImageInsight_Similarity"] <= 1
     assert 0 <= scores["BLEU"] <= 1
     if include_bertscore:
         assert scores["BERT_Score"] > 0.99

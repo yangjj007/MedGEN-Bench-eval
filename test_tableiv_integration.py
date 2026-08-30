@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,7 +16,7 @@ import inference
 
 
 ROOT = Path(__file__).resolve().parent
-DATASET = ROOT / "MedGEN_TableIV"
+DATASET = Path(os.environ.get("MEDGEN_TABLEIV_DIR", ROOT / "MedGEN_TableIV")).resolve()
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -24,6 +25,14 @@ def load_jsonl(path: Path) -> list[dict]:
 
 
 class TableIVIntegrationTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not DATASET.is_dir():
+            raise unittest.SkipTest(
+                "Prepared Table IV data is unavailable; set MEDGEN_TABLEIV_DIR "
+                "after running prepare_medgen_tableiv.py"
+            )
+
     def test_adapter_manifest_and_counts(self) -> None:
         manifest = json.loads((DATASET / "adapter_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["validation"]["record_count"], 6623)
@@ -96,7 +105,11 @@ class TableIVIntegrationTest(unittest.TestCase):
                 "BLEU": 0.5,
                 "BERT_Score": 0.9,
                 "vlm_judge_w_gt_result": {
-                    "content_accuracy": {"score": 8},
+                    "anatomical_accuracy": {"score": 8},
+                    "clinical_finding_accuracy": {"score": 8},
+                    "instruction_compliance": {"score": 8},
+                    "cross_modal_consistency": {"score": 8},
+                    "hallucination_omission_control": {"score": 8},
                     "overall_score": 9,
                 },
             },
@@ -104,7 +117,7 @@ class TableIVIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(metrics["BLEU"], 0.5)
         self.assertEqual(metrics["BERT_Score"], 0.9)
-        self.assertEqual(metrics["VLM_Content_Accuracy_W_GT"], 8.0)
+        self.assertEqual(metrics["VLM_Anatomical_Accuracy_W_GT"], 8.0)
         self.assertEqual(metrics["VLM_Overall_Score_W_GT"], 9.0)
 
 

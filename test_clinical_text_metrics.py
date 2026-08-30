@@ -10,12 +10,9 @@ from unittest.mock import patch
 
 import util.clinical_text_metrics as clinical_text_metrics
 from util.clinical_text_metrics import (
-    compute_clinical_entity_metrics,
-    compute_entity_error_metrics,
-    compute_factual_precision_chexbert,
     compute_radgraph_f1,
-    compute_task_accuracy,
-    compute_text_em_f1,
+    compute_radgraph_f1_batch,
+    compute_text_exact_match,
     normalize_closed_form_answer,
     serialize_clinical_reference,
 )
@@ -67,44 +64,12 @@ class ClinicalTextMetricTest(unittest.TestCase):
             "b. heart",
         )
 
-    def test_compute_task_accuracy_uses_closed_form_normalization(self) -> None:
-        choices = [
-            "A. Morton's neuroma",
-            "B. Anterometatarsal bursitis",
-        ]
-        self.assertEqual(
-            compute_task_accuracy(
-                paper_task="multiple-choice",
-                response="B",
-                answer="B. Anterometatarsal bursitis",
-                choices=choices,
-            ),
-            1.0,
-        )
-
-    def test_compute_text_em_f1_handles_short_answers(self) -> None:
-        em, f1 = compute_text_em_f1(
+    def test_compute_text_exact_match_normalizes_whitespace(self) -> None:
+        em = compute_text_exact_match(
             response="Subacute thyroiditis",
-            answer="Subacute thyroiditis (de Quervain's thyroiditis)",
+            answer=" subacute   thyroiditis ",
         )
-        self.assertEqual(em, 0.0)
-        self.assertGreater(f1, 0.45)
-
-    def test_compute_clinical_entity_metrics_matches_equivalent_reports(self) -> None:
-        reference = (
-            "FINDINGS: Lungs are clear. No pleural effusion. "
-            "Cardiomediastinal silhouette is within normal limits."
-        )
-        response = (
-            "No pleural effusion is seen. Lungs clear bilaterally. "
-            "Heart size and mediastinal contour are within normal limits."
-        )
-
-        metrics = compute_clinical_entity_metrics(response, reference)
-
-        self.assertGreaterEqual(metrics["precision"], 0.75)
-        self.assertGreaterEqual(metrics["recall"], 0.75)
-        self.assertGreaterEqual(metrics["f1"], 0.75)
+        self.assertEqual(em, 1.0)
 
     def test_compute_radgraph_f1_fails_when_scorer_unavailable(self) -> None:
         with patch.object(
@@ -170,40 +135,42 @@ class ClinicalTextMetricTest(unittest.TestCase):
         self.assertIsNone(result["f1"])
         self.assertEqual(result["backend"], "radgraph")
 
+    def test_compute_radgraph_f1_batch_preserves_per_sample_rg_er(self) -> None:
+        entity = {"entities": {"1": {"tokens": "opacity", "relations": []}}}
 
-    def test_entity_error_metrics_detect_hallucination_and_omission(self) -> None:
-        # 响应中多出 nodule（幻觉），遗漏了 pleural effusion（遗漏）
-        result = compute_entity_error_metrics(
-            "Chest radiograph shows a pulmonary nodule in the right upper lobe.",
-            "Chest radiograph shows a right pleural effusion.",
-        )
-        self.assertGreater(result["hallucination_rate"], 0.0)
-        self.assertGreater(result["omission_rate"], 0.0)
-        self.assertIn("nodule", result["hallucinated_entities"])
-        self.assertIn("pleural effusion", result["omitted_entities"])
-        self.assertLess(result["factual_precision"], 1.0)
+        class FakeBatchScorer:
+            def __call__(self, hyps, refs):
+                self.hyps = hyps
+                self.refs = refs
+                return (
+                    (0.5, 0.6, 0.7),
+                    ([0.4, 0.6], [0.7, 0.9], [0.5, 0.8]),
+                    [entity, {"entities": {}}],
+                    [entity, {"entities": {}}],
+                )
 
-    def test_entity_error_metrics_perfect_match_is_zero_error(self) -> None:
-        result = compute_entity_error_metrics(
-            "No pneumothorax. Lungs are clear.",
-            "No pneumothorax. Lungs are clear.",
-        )
-        self.assertEqual(result["hallucination_rate"], 0.0)
-        self.assertEqual(result["omission_rate"], 0.0)
-        self.assertEqual(result["factual_precision"], 1.0)
+        scorer = FakeBatchScorer()
+        with patch.object(clinical_text_metrics, "_get_radgraph_f1_scorer", return_value=scorer):
+            results = compute_radgraph_f1_batch(
+                [
+                    "There is a right lung opacity.",
+                    "No acute cardiopulmonary abnormality.",
+                    "short",
+                ],
+                [
+                    "There is a right lung opacity.",
+                    "No acute cardiopulmonary abnormality.",
+                    "short",
+                ],
+            )
 
-    def test_entity_error_metrics_empty_both_sides(self) -> None:
-        result = compute_entity_error_metrics("normal", "normal")
-        self.assertEqual(result["hallucination_rate"], 0.0)
-        self.assertEqual(result["omission_rate"], 0.0)
-        self.assertEqual(result["factual_precision"], 1.0)
+        self.assertEqual(len(scorer.hyps), 2)
+        self.assertTrue(results[0]["applicable"])
+        self.assertAlmostEqual(results[0]["f1"], 0.7)
+        self.assertFalse(results[1]["applicable"])
+        self.assertIsNone(results[1]["f1"])
+        self.assertEqual(results[2]["backend"], "skipped")
 
-    def test_chexbert_hook_disabled_by_default(self) -> None:
-        self.assertIsNone(compute_factual_precision_chexbert("text", "text"))
-
-    def test_chexbert_hook_enabled_but_module_missing_returns_none(self) -> None:
-        with patch.dict("os.environ", {"MEDGEN_ENABLE_CHEXBERT": "1"}, clear=False):
-            self.assertIsNone(compute_factual_precision_chexbert("text", "text"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+# Tested local VLM server environment: Python 3.10, CUDA 12.8, vLLM 0.11.0.
+# vLLM installs its matching CUDA/PyTorch dependencies.
+vllm==0.11.0
+# Qwen3-VL-8B-Instruct was verified against this Transformers release.
+transformers==4.57.1

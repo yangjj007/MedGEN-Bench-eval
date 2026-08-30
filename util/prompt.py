@@ -1,60 +1,3 @@
-'''
-整体级（同时考虑文本图像）：
-
-MLLM（4o）评分
-根据输入/输出图文列对若干个维度评分：
-
-连贯性（Coherence）：文本与图像是否传达统一信息。
-内容准确性（Content Accuracy）：文本与图像的事实正确性。
-相关性与响应性（Relevance）：生成内容是否贴合查询需求。
-视觉-文本对齐（Visual-Textual Alignment）：图像与文本信息的匹配程度。
-一致性（Consistency）：图像类型与文本格式是否跟指令一致
-'''
-
-
-# todo:参考范例和整体级评分完成下面两个提示词的润色
-
-# vlm_holistic_judge_w_gt_prompt = '''
-# You are a helpful AI judge expert that good at judge the medical image text generation model performance.
-# 你会收到ground truth text和image，还有模型生成的待评价 text和image。 你需要对比评价2者，并且依照ground truth对模型生成评分。
-
-# image grounding：
-# 所有输入图片都有人为添加渲染的黑色文本，在图片下缘的剧中位置，用来指示当前图片的类型。
-# 对于ground truth image，“Ground Truth”作为其image grounding
-# 对于生成 image，“Generated Answer”作为其image grounding
-
-# 从下列几个维度做评价：
-# 连贯性（Coherence）：文本与图像是否传达统一信息。
-# 内容准确性（Content Accuracy）：文本与图像的事实正确性。
-# 相关性与响应性（Relevance）：生成内容是否贴合查询需求。
-# 视觉-文本对齐（Visual-Textual Alignment）：图像与文本信息的匹配程度。
-# 一致性（Consistency）：图像类型与文本格式是否跟指令一致
-
-# Output Requirement: Please output in JSON format, including scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score. The JSON should follow this structure:
-
-# '''
-
-# vlm_holistic_judge_wo_gt_prompt = '''
-# You are a helpful AI judge expert that good at judge the medical image text generation model performance.
-# 你会收到作为任务输入的instruction text和image，还有模型生成的待评价 text和image。 你需要对比2者，并且依据文本指令去判断模型生成内容是否很好的完成了文本指令对图片的要求。
-
-# image grounding：
-# 所有输入图片都有人为添加渲染的黑色文本，在图片下缘的剧中位置，用来指示当前图片的类型。
-# 对于input image，“Input”作为其image grounding
-# 对于output image，“Output”作为其image grounding
-
-# 从下列几个维度做评价：
-# 连贯性（Coherence）：文本与图像是否传达统一信息。
-# 内容准确性（Content Accuracy）：文本与图像的事实正确性。
-# 相关性与响应性（Relevance）：生成内容是否贴合查询需求。
-# 视觉-文本对齐（Visual-Textual Alignment）：图像与文本信息的匹配程度。
-# 一致性（Consistency）：图像类型与文本格式是否跟指令一致
-
-# Output Requirement: Please output in JSON format, including scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score. The JSON should follow this structure:
-
-# '''
-
-
 vlm_holistic_judge_w_gt_prompt = ["""
 You are a helpful and impartial AI judge expert specialized in evaluating medical image-text generation model performance. You will be provided with ground truth text and images, as well as model-generated text or images for evaluation. Please compare and evaluate these against the ground truth.
 
@@ -67,6 +10,7 @@ Judge Requirement: Evaluate the model-generated content based on the following m
 1. Anatomical Accuracy: Whether anatomical structures, locations, and spatial relationships are correct.
 2. Clinical Finding Accuracy: Whether findings, pathology, severity, and devices are medically correct.
 3. Instruction Compliance: Whether the generated content follows the instruction and requested transformation exactly.
+Global pixel similarity alone is not sufficient. Explicitly inspect clinically salient small or subtle details, including focal lesions, small nodules, thin vessels, microcalcifications, fine boundaries, devices, and target-region detail. Penalize a missed, blurred, distorted, newly invented, or relocated clinically salient feature even when global anatomy and overall appearance look similar.
 """,
 """
 4. Cross-Modal Consistency: Whether the text and image content support the same medical conclusion.
@@ -129,6 +73,7 @@ Judge Requirement: Evaluate the model-generated content based on the following m
 1. Anatomical Accuracy: Whether anatomical structures, locations, and spatial relationships are correct.
 2. Clinical Finding Accuracy: Whether findings, pathology, severity, and devices are medically correct.
 3. Instruction Compliance: Whether the generated content follows the instruction and requested transformation exactly.
+Global pixel similarity alone is not sufficient. Explicitly inspect clinically salient small or subtle details, including focal lesions, small nodules, thin vessels, microcalcifications, fine boundaries, devices, and target-region detail. Penalize a missed, blurred, distorted, newly invented, or relocated clinically salient feature even when global anatomy and overall appearance look similar.
 """,
 """
 4. Cross-Modal Consistency: Whether the text and image content support the same medical conclusion.
@@ -177,14 +122,9 @@ Here is the Generated Answer:
 Now please judge the generated output based on how well it fulfills the instruction requirements. Remember to output in JSON format with scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score.
 """]
 
-
-['\nYou are a helpful and impartial AI judge expert specialized in evaluating medical image-text generation model performance. You will be provided with instruction text and input images, as well as model-generated text or images for evaluation. Please assess whether the generated content successfully fulfills the requirements specified in the text instructions.\n\nImage Grounding Information:\nAll images contain artificially rendered black text at the bottom center to indicate the image type:\n- Input images are labeled with "Input"\n- Output images that model generate are labeled with "Output"\n\nJudge Requirement: Evaluate the model-generated content based on the following dimensions:\n1. Content Accuracy: The factual correctness of both textual information and visual elements, particularly important in medical contexts.\n2. Relevance and Responsiveness: How well the generated content addresses the given query and meets the specific requirements.\n3. Consistency: Whether the image type or text format align with the given instructions and maintain coherent style.\n',
-    '', '\n\nOutput Requirement: Please output in JSON format, including scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score. The JSON should follow this structure:\n\n{{\n  "content_accuracy": {{\n    "score": 0,\n    "explanation": ""\n  }},\n  "relevance_and_responsiveness": {{\n    "score": 0,\n    "explanation": ""\n  }},\n  "consistency": {{\n    "score": 0,\n    "explanation": ""\n  }},\n', '', '\n  "overall_score": 0,\n  "final_thoughts": ""\n}}\n\nHere is the Instruction:\n', '\nHere is the Input (Text and Images):\n', '\nHere is the Generated Output (Text and Images):\n', '\nNow please judge the generated output based on how well it fulfills the instruction requirements. Remember to output in JSON format with scores for each dimension (on a scale of 1-10) and a final overall score (on a scale of 1-10). Also provide brief explanations for each score.\n']
-
-
-# --- 任务特定 judge 检查清单 ---
-# 保留 5 维临床评分（解剖准确性 / 临床发现准确性 / 指令遵循 / 跨模态一致性 /
-# 幻觉与遗漏控制），并为每个任务补充可观察的判定标准，减少 prompt 漂移。
+# --- Task-specific judge checklists ---
+# Preserve the five clinical dimensions and add observable task-specific
+# criteria to reduce prompt drift.
 TASK_JUDGE_CHECKLISTS = {
     'vqa': (
         "1. Answer fidelity: the generated text answers the exact question asked, "
@@ -198,10 +138,11 @@ TASK_JUDGE_CHECKLISTS = {
     'image_edit': (
         "1. Transformation applied: the requested edit (artifact removal, contrast "
         "enhancement, resolution editing, etc.) is actually present in the target region.\n"
-        "2. Context preserved: anatomy outside the edit region is unchanged and intact.\n"
+        "2. Context comparison: inspect non-target anatomy that is visible in the provided images; do not infer pixel-level preservation beyond the available references.\n"
         "3. Artifact-free: penalize new blur, noise, or unrealistic textures introduced "
         "by the edit.\n"
-        "4. Clinical plausibility: the edited image stays anatomically and clinically "
+        "4. Small-detail inspection: explicitly check focal lesions, thin vessels, microcalcifications, fine boundaries, devices, and other subtle target-region detail.\n"
+        "5. Clinical plausibility: the edited image stays anatomically and clinically "
         "consistent with the ground truth."
     ),
     'multimodal_generation': (
@@ -211,13 +152,14 @@ TASK_JUDGE_CHECKLISTS = {
         "changes are anatomically plausible.\n"
         "3. No invented content: penalize structures, findings, or devices that do not "
         "appear in the ground truth.\n"
-        "4. Format match: the output image-text pairing follows the instruction."
+        "4. Small-detail inspection: explicitly check focal lesions, thin vessels, microcalcifications, fine boundaries, devices, and subtle target-region detail.\n"
+        "5. Format match: the output image-text pairing follows the instruction."
     ),
 }
 
 
 def build_vlm_judge_prompt(task: str, with_gt: bool) -> list:
-    """按任务生成结构化检查清单 judge prompt（段布局与基础 prompt 一致）。"""
+    """Build a structured checklist prompt while preserving the base layout."""
     base = list(vlm_holistic_judge_w_gt_prompt if with_gt else vlm_holistic_judge_wo_gt_prompt)
     checklist = TASK_JUDGE_CHECKLISTS.get(task, '')
     if checklist:
@@ -229,3 +171,14 @@ def build_vlm_judge_prompt(task: str, with_gt: bool) -> list:
             + checklist
         )
     return base
+
+
+def build_vqa_control_judge_prompt(with_reference: bool) -> str:
+    """Prompt for VQA controls; no image is ever called a ground-truth image."""
+    reference = (
+        "A text reference answer is provided for sensitivity analysis. It is a "
+        "text reference only; there is no ground-truth output image.\n"
+        "TEXT REFERENCE:\n{reference}\n"
+        if with_reference else ""
+    )
+    return """You are an impartial medical VQA judge. Evaluate only the current input image(s), the instruction, and the model response. Do not infer or mention experimental conditions, donor identities, sample IDs, or hidden metadata.\n\nScore each dimension from 1 (severely incorrect) to 5 (fully correct): anatomical_accuracy, clinical_finding_accuracy, instruction_compliance, cross_modal_consistency, hallucination_omission_control. Inspect focal lesions, subtle structures, laterality, devices, boundaries, and clinically important omissions or hallucinations. In the reference-free view, do not compare against an answer that is not shown; judge whether the response is supported by the current image and answers the instruction.\n\nINSTRUCTION:\n{instruction}\n\n{reference}MODEL RESPONSE:\n{response}\n\nReturn JSON only with this schema: {{"anatomical_accuracy":{{"score":0,"explanation":""}},"clinical_finding_accuracy":{{"score":0,"explanation":""}},"instruction_compliance":{{"score":0,"explanation":""}},"cross_modal_consistency":{{"score":0,"explanation":""}},"hallucination_omission_control":{{"score":0,"explanation":""}},"overall_score":0,"final_thoughts":""}}"""

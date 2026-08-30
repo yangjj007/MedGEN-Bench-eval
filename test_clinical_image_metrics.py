@@ -10,7 +10,8 @@ import numpy as np
 from PIL import Image
 
 from util.metrics import (
-    batch_async_anatomical_metrics,
+    FR_IQA,
+    batch_async_medimageinsight_metrics,
     compute_anatomical_embedding_similarity,
 )
 
@@ -33,7 +34,18 @@ class AnatomicalMetricTest(unittest.TestCase):
     def test_batch_requires_aligned_pairs(self) -> None:
         eval_img, ref = _make_images()
         with self.assertRaises(ValueError):
-            asyncio.run(batch_async_anatomical_metrics([eval_img], [ref, ref]))
+            asyncio.run(batch_async_medimageinsight_metrics([eval_img], [ref, ref]))
+
+    def test_full_reference_image_metrics_have_documented_ranges(self) -> None:
+        """Regression guard for the raw (not 0--100 normalized) metrics."""
+        candidate, reference = _make_images(lesion_shift=40)
+        ssim = FR_IQA(candidate, reference, "ssim")
+        psnr = FR_IQA(candidate, reference, "psnr")
+        lpips = FR_IQA(candidate, reference, "lpips")
+        self.assertGreaterEqual(ssim, -1.0)
+        self.assertLessEqual(ssim, 1.0)
+        self.assertTrue(np.isfinite(psnr))
+        self.assertGreaterEqual(lpips, 0.0)
 
 
 if __name__ == "__main__":
