@@ -20,8 +20,12 @@ bash download_medimageinsight.sh
 ```
 
 This creates `MedGEN_raw/` for the downloaded source and `MedGEN_data/` for
-the prepared data used by inference and evaluation. The paired dataset is
+the prepared data used by inference and evaluation. The download contains the
+`image_editing`, `multimodal_generation`, and `vqa` parquet configurations.
+The paired dataset is
 [Jack04810/MedGEN-Bench](https://huggingface.co/datasets/Jack04810/MedGEN-Bench).
+The download script is pinned to the Parquet revision used for this release;
+set `MEDGEN_DATASET_REVISION` only when intentionally using another revision.
 
 ## Configuration
 

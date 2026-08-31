@@ -68,6 +68,22 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
         self.assertFalse(bundles[0]["radgraph_applicable"])
         self.assertIsNone(bundles[0]["RadGraph_F1"])
 
+    def test_parquet_multiple_choice_uses_options_embedded_in_instruction(self) -> None:
+        bundles = eval_module.compute_text_metric_bundles(
+            [
+                {
+                    "paper_task": "multiple-choice",
+                    "instruction": "Question: Which finding is present?\n\nOptions:\n"
+                    "A. atelectasis\nB. pneumonia\nC. edema",
+                    "response": "B",
+                    "answer": "B. pneumonia",
+                }
+            ],
+            include_radgraph=False,
+        )
+        self.assertEqual(bundles[0]["normalized_response_text"], "b. pneumonia")
+        self.assertEqual(bundles[0]["Text_EM"], 1.0)
+
     def test_build_vlm_judge_client_passes_judge_config(self) -> None:
         calls = []
 

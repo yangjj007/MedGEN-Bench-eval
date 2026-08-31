@@ -19,6 +19,7 @@ from util.prompt import (
 from util.format_parser import extract_json
 from util.clinical_text_metrics import (
     serialize_clinical_reference,
+    extract_choices_from_instruction,
     normalize_closed_form_answer,
     compute_closed_form_exact_match,
     compute_text_exact_match,
@@ -73,9 +74,9 @@ JUDGE_DIMENSIONS = {
     'hallucination_omission_control': 'VLM_Hallucination_Omission_Control',
 }
 
-# The canonical Table IV view contains exactly these 16 paper tasks.  Keep the
-# list in one place so a renamed task cannot silently fall through to a generic
-# image metric or an unconditioned judge prompt.
+# The benchmark taxonomy contains exactly these 16 tasks. Keep the list in one
+# place so a renamed task cannot silently fall through to a generic image metric
+# or an unconditioned judge prompt.
 SUPPORTED_PAPER_TASKS = {
     'multiple-choice', 'blank-filling', 'report-generation', 'question-answering',
     'style-transfer', 'artifact-removal', 'noise-reconstruction',
@@ -115,7 +116,7 @@ def paper_task_for_item(item: dict) -> str:
     """Resolve canonical task names from current and historical result JSONL.
 
     Older baseline exports sometimes stored a generic mission name in
-    ``paper_task`` and the actual Table IV task in ``sub-category``.  Prefer
+    ``paper_task`` and the actual benchmark task in ``sub-category``. Prefer
     that specific sub-category in this case.  Historical names such as
     ``dye-transfer`` are aliases of the canonical 16-task taxonomy.
     """
@@ -133,7 +134,7 @@ def validate_paper_task(value: object) -> str:
     task_name = normalize_paper_task(value)
     if task_name not in SUPPORTED_PAPER_TASKS:
         raise ValueError(
-            f"Unknown paper_task={value!r}; expected one of the 16 Table IV tasks: "
+            f"Unknown paper_task={value!r}; expected one of the 16 benchmark tasks: "
             + ', '.join(sorted(SUPPORTED_PAPER_TASKS))
         )
     return task_name
@@ -290,13 +291,26 @@ def generate_sample_id(item: dict) -> str:
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
+def choices_for_item(item: dict) -> list[str]:
+    """Return explicit choices or recover them from a Parquet VQA instruction."""
+    for field in ('choice', 'choices'):
+        value = item.get(field)
+        if isinstance(value, str) and value.strip():
+            return [value]
+        if isinstance(value, (list, tuple)):
+            choices = [str(choice) for choice in value if str(choice).strip()]
+            if choices:
+                return choices
+    return extract_choices_from_instruction(item.get('instruction', ''))
+
+
 def canonical_answer_text(item: dict) -> str:
     answer = item.get('answer', '')
     if isinstance(answer, dict):
         return serialize_clinical_reference(answer)
     paper_task = normalize_paper_task(paper_task_for_item(item))
     if paper_task in {'multiple-choice', 'blank-filling'}:
-        return normalize_closed_form_answer(answer, item.get('choice') or [])
+        return normalize_closed_form_answer(answer, choices_for_item(item))
     return " ".join(str(answer or '').strip().split())
 
 
@@ -304,7 +318,7 @@ def canonical_response_text(item: dict) -> str:
     response = str(item.get('response', '') or '')
     paper_task = normalize_paper_task(paper_task_for_item(item))
     if paper_task in {'multiple-choice', 'blank-filling'}:
-        return normalize_closed_form_answer(response, item.get('choice') or [])
+        return normalize_closed_form_answer(response, choices_for_item(item))
     return " ".join(response.strip().split())
 
 
@@ -319,7 +333,12 @@ def _text_metric_bundle_without_radgraph(item: dict) -> dict:
     }
 
     if paper_task in CLOSED_FORM_TEXT_EM_TASKS:
-        closed = compute_closed_form_exact_match(item.get('response', ''), item.get('answer', ''), item.get('choice') or [], paper_task)
+        closed = compute_closed_form_exact_match(
+            item.get('response', ''),
+            item.get('answer', ''),
+            choices_for_item(item),
+            paper_task,
+        )
         metrics['Text_EM'] = closed['score']
         metrics['Text_EM_parse_status'] = closed['parse_status']
         metrics['Text_EM_parsed_answer'] = closed['parsed_answer']

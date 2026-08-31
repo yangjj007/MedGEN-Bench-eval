@@ -78,6 +78,23 @@ def _choice_mappings(choices: Iterable[str] | None) -> dict[str, str]:
     return mappings
 
 
+def extract_choices_from_instruction(instruction: Any) -> list[str]:
+    """Extract labelled options retained in a multiple-choice instruction."""
+    text = str(instruction or "")
+    marker = re.search(r"\boptions?\s*:\s*", text, flags=re.IGNORECASE)
+    if not marker:
+        return []
+    choices: list[str] = []
+    for line in text[marker.end():].splitlines():
+        match = re.match(r"^\s*([A-Z])[\.)\]:-]\s*(.*)$", line, flags=re.IGNORECASE)
+        if not match:
+            continue
+        body = match.group(2).strip()
+        if body:
+            choices.append(f"{match.group(1).upper()}. {body}")
+    return choices
+
+
 def normalize_closed_form_answer(text: Any, choices: Iterable[str] | None = None) -> str:
     text = str(text or "")
     mappings = _choice_mappings(choices)
@@ -99,6 +116,14 @@ def parse_closed_form_answer(text: Any, choices: Iterable[str] | None = None,
     task = str(task or "").lower()
     if task == "multiple-choice":
         mappings = _choice_mappings(choices)
+        if not mappings:
+            # The parquet release intentionally omits the duplicate choices
+            # column. Preserve answer text rather than inventing a mapping.
+            return {
+                "parse_status": "parsed",
+                "parsed_answer": normalize_free_text(raw),
+                "parse_failure_reason": None,
+            }
         # Prefer an explicitly labelled final answer, scanning from the end so
         # explanations containing option letters do not win.
         for line in reversed([x.strip() for x in raw.splitlines() if x.strip()]):

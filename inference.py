@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--jsonl-path", "--jsonl_path", dest="jsonl_path", required=True,
-        help="Input Table IV JSONL file.",
+        help="Input prepared MedGEN JSONL file.",
     )
     parser.add_argument(
         "--mission", choices=("generate", "edit", "vqa"), required=True,
@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def record_key(record: Mapping[str, Any]) -> str:
-    """Return a stable resume key for Table IV and legacy records."""
+    """Return a stable resume key for prepared and legacy records."""
     sample_id = record.get("sample_id")
     if sample_id:
         return str(sample_id)

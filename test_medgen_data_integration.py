@@ -34,6 +34,11 @@ class MedGENDataIntegrationTest(unittest.TestCase):
 
     def test_adapter_manifest_and_counts(self) -> None:
         manifest = json.loads((DATASET / "adapter_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(manifest["source_format"], "parquet")
+        self.assertEqual(
+            manifest["source_configs"],
+            ["image_editing", "multimodal_generation", "vqa"],
+        )
         self.assertEqual(manifest["validation"]["record_count"], 6623)
         self.assertEqual(
             manifest["validation"]["mission_counts"],
@@ -41,7 +46,7 @@ class MedGENDataIntegrationTest(unittest.TestCase):
         )
         self.assertEqual(manifest["validation"]["paper_task_count"], 16)
         self.assertEqual(manifest["validation"]["missing_image_path_count"], 0)
-        self.assertTrue((DATASET / "source").resolve().is_dir())
+        self.assertGreater(manifest["validation"]["materialized_image_count"], 0)
 
     def test_full_inference_inputs(self) -> None:
         cases = (
@@ -69,10 +74,10 @@ class MedGENDataIntegrationTest(unittest.TestCase):
         records = load_jsonl(DATASET / "smoke_vqa.jsonl")
         self.assertEqual(len(records), 4)
         for record in records:
-            self.assertEqual(
-                record["eval_adapter"]["input_strategy"], "labeled_contact_sheet"
-            )
-            self.assertGreaterEqual(len(record["input_images"]), 2)
+            self.assertIn("input_images", record)
+            self.assertGreaterEqual(len(record["input_images"]), 1)
+            if len(record["input_images"]) > 1:
+                self.assertIn("vqa_contact_sheets", record["input_image"])
             image_path = DATASET / record["input_image"]
             with Image.open(image_path) as image:
                 image.verify()

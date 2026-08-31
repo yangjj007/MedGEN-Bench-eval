@@ -9,9 +9,11 @@ from unittest.mock import patch
 
 import util.clinical_text_metrics as clinical_text_metrics
 from util.clinical_text_metrics import (
+    compute_closed_form_exact_match,
     compute_radgraph_f1,
     compute_radgraph_f1_batch,
     compute_text_exact_match,
+    extract_choices_from_instruction,
     normalize_closed_form_answer,
     serialize_clinical_reference,
 )
@@ -69,6 +71,29 @@ class ClinicalTextMetricTest(unittest.TestCase):
             answer=" subacute   thyroiditis ",
         )
         self.assertEqual(em, 1.0)
+
+    def test_multiple_choice_without_choices_uses_answer_text(self) -> None:
+        result = compute_closed_form_exact_match(
+            "Ischemic stroke lesion",
+            "ischemic stroke lesion",
+            choices=[],
+            task="multiple-choice",
+        )
+        self.assertEqual(result["score"], 1.0)
+
+    def test_multiple_choice_options_are_recovered_from_instruction(self) -> None:
+        choices = extract_choices_from_instruction(
+            "Question: Which finding is present?\n\nOptions:\n"
+            "A. atelectasis\nB. pneumonia\nC. edema"
+        )
+        self.assertEqual(choices, ["A. atelectasis", "B. pneumonia", "C. edema"])
+        result = compute_closed_form_exact_match(
+            "The answer is B.",
+            "B. pneumonia",
+            choices=choices,
+            task="multiple-choice",
+        )
+        self.assertEqual(result["score"], 1.0)
 
     def test_compute_radgraph_f1_fails_when_scorer_unavailable(self) -> None:
         with patch.object(
