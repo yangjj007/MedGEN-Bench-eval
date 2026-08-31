@@ -21,13 +21,6 @@
 !/run_external_pipeline.sh
 !/run_local_pipeline.sh
 
-!/test_medgen_data_integration.py
-!/test_parquet_adapter.py
-!/test_metrics_smoke.py
-!/test_clinical_text_metrics.py
-!/test_eval_clinical_integration.py
-!/test_clinical_image_metrics.py
-
 !/api/
 /api/*
 !/api/__init__.py
