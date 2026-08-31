@@ -21,6 +21,9 @@
 !/run_external_pipeline.sh
 !/run_local_pipeline.sh
 
+!/assets/
+!/assets/**
+
 !/api/
 /api/*
 !/api/__init__.py
