@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Focused unit tests for the new clinical-text evaluation helpers."""
 
 from __future__ import annotations

@@ -1,13 +1,12 @@
-#!/usr/bin/env bash
 # Start a localhost-only OpenAI-compatible server for Qwen-Image-Edit.
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 server_python="${QWEN_IMAGE_PYTHON:-python3}"
-model_name="${QWEN_IMAGE_EDIT_MODEL:-Qwen/Qwen-Image-Edit}"
+model_name="${QWEN_IMAGE_EDIT_MODEL:-$root_dir/models/Qwen-Image-Edit}"
 host="${QWEN_IMAGE_HOST:-127.0.0.1}"
 port="${QWEN_IMAGE_PORT:-8001}"
-output_dir="${QWEN_IMAGE_OUTPUT_DIR:-$root_dir/local_image_outputs}"
+output_dir="${QWEN_IMAGE_OUTPUT_DIR:-$root_dir/outputs/local-image-service}"
 steps="${QWEN_IMAGE_STEPS:-30}"
 cfg_scale="${QWEN_IMAGE_CFG_SCALE:-4.0}"
 cpu_offload_mode="${QWEN_IMAGE_CPU_OFFLOAD:-none}"
@@ -27,7 +26,7 @@ case "$cpu_offload_mode" in
 esac
 
 if ! "$server_python" -c 'import diffusers, fastapi, torch, uvicorn' >/dev/null 2>&1; then
-    echo "Missing local image-server dependencies. Install requirements-local-image.txt first." >&2
+    echo "Missing local image-server dependencies. Install requirements.txt first." >&2
     exit 1
 fi
 

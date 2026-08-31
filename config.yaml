@@ -1,0 +1,18 @@
+# Shared configuration for external OpenAI-compatible APIs.
+# Keep credentials in environment variables, never in this file.
+api_key: ""
+base_url: "https://aihubmix.com/v1"
+image_base_url: "https://aihubmix.com/v1"
+model_name: "qwen3-vl-235b-a22b-instruct"
+image_edit_model_name: "gpt-image-1-mini"
+max_retries: 3
+retry_delay: 2
+timeout: 120
+image_timeout: 1800
+temperature: 0.4
+
+# Standard OpenAI-compatible image routes. Override only when a provider uses
+# different endpoints.
+image_generation_endpoint: "/images/generations"
+image_edit_endpoint: "/images/edits"
+image_to_image_endpoint: "/images/edits"

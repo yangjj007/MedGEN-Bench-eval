@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Launch vLLM with the narrow Gemma3 config compatibility shim we need.
 
 vLLM 0.8.5 reads ``Gemma3TextConfig.sliding_window_pattern``.  Transformers

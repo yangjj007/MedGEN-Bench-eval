@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Integration checks for eval.py clinical metric extraction."""
 
 from __future__ import annotations
@@ -31,7 +30,7 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
                 "--judge_model",
                 "instruct-biomedgpt-base",
                 "--judge_config",
-                "./api/config.vllm.yaml",
+                "./config.yaml",
                 "--judge_backend",
                 "api",
                 "--enable_clinical_text_metrics",
@@ -39,7 +38,7 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
             ]
         )
         self.assertEqual(args.judge_model, "instruct-biomedgpt-base")
-        self.assertEqual(args.judge_config, "./api/config.vllm.yaml")
+        self.assertEqual(args.judge_config, "./config.yaml")
         self.assertEqual(args.judge_backend, "api")
         self.assertTrue(args.enable_clinical_text_metrics)
         self.assertTrue(args.disable_radgraph)
@@ -83,30 +82,30 @@ class EvalClinicalIntegrationTest(unittest.TestCase):
                 run_vlm_judge=True,
                 judge_model="MedVision-V0-7B",
                 judge_backend="api",
-                judge_config="./api/config.vllm.yaml",
+                judge_config="./config.yaml",
             )
             eval_module.build_vlm_judge_client(
                 run_vlm_judge=True,
                 judge_model="",
                 judge_backend="api",
-                judge_config="./api/config.vllm.yaml",
+                judge_config="./config.yaml",
             )
             self.assertIsNone(
                 eval_module.build_vlm_judge_client(
                     run_vlm_judge=False,
                     judge_model="MedVision-V0-7B",
                     judge_backend="api",
-                    judge_config="./api/config.vllm.yaml",
+                    judge_config="./config.yaml",
                 )
             )
         finally:
             eval_module.double_image_vlm = original
 
         self.assertEqual(len(calls), 2)
-        self.assertEqual(calls[0]["config_path"], "./api/config.vllm.yaml")
+        self.assertEqual(calls[0]["config_path"], "./config.yaml")
         self.assertEqual(calls[0]["model_name"], "MedVision-V0-7B")
         # An empty judge_model lets double_image_vlm fall back to model_name in the config.
-        self.assertEqual(calls[1]["config_path"], "./api/config.vllm.yaml")
+        self.assertEqual(calls[1]["config_path"], "./config.yaml")
         self.assertEqual(calls[1]["model_name"], "")
 
     def test_metric_thresholds_fixed_for_ssim_and_extended(self) -> None:

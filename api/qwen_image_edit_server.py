@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """OpenAI-compatible local server for Qwen-Image-Edit.
 
 The standard vLLM server is used for the Qwen vision-language model.  Image
@@ -60,7 +59,7 @@ class QwenImageEditRunner:
         except ImportError as exc:  # pragma: no cover - environment-specific
             raise RuntimeError(
                 "Qwen Image Edit requires torch, diffusers, transformers, and accelerate. "
-                "Install requirements-local-image.txt in the server environment."
+                "Install requirements.txt in the server environment."
             ) from exc
 
         dtype = getattr(torch, self.settings.dtype)
@@ -247,11 +246,16 @@ def build_app(settings: ServerSettings) -> FastAPI:
 
 
 def parse_args() -> argparse.Namespace:
+    project_root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", default="Qwen/Qwen-Image-Edit")
+    parser.add_argument("--model", default=str(project_root / "models" / "Qwen-Image-Edit"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8001)
-    parser.add_argument("--output-dir", type=Path, default=Path("local_image_outputs"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=project_root / "outputs" / "local-image-service",
+    )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=["float16", "bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--local-files-only", action="store_true")

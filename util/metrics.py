@@ -6,6 +6,13 @@ from typing import List, Tuple, Union
 import functools
 import threading
 import os
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_MODEL_ROOT = _PROJECT_ROOT / "models"
+os.environ.setdefault("HF_HOME", str(_MODEL_ROOT / "HuggingFace"))
+os.environ.setdefault("HF_HUB_CACHE", str(_MODEL_ROOT / "HuggingFace" / "hub"))
+os.environ.setdefault("TORCH_HOME", str(_MODEL_ROOT / "Torch"))
 try:
     import torch
 except ImportError:
@@ -63,7 +70,7 @@ model or its local dependencies are unavailable.
 
 _MEDIMAGEINSIGHT_DIR = os.environ.get(
     "MEDGEN_MEDIMAGEINSIGHT_DIR",
-    "~/.cache/medgen-bench/MedImageInsights",
+    str(_MODEL_ROOT / "MedImageInsights"),
 )
 _MEDIMAGEINSIGHT_VISION_WEIGHTS = os.environ.get(
     "MEDGEN_MEDIMAGEINSIGHT_WEIGHTS", "2024.09.27/vision_model/medimageinsigt-v1.0.0.pt"

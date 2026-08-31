@@ -5,7 +5,11 @@ import logging
 import os
 import re
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Iterable
+
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_MODEL_ROOT = _PROJECT_ROOT / "models"
 
 
 SECTION_ORDER = [
@@ -200,7 +204,7 @@ def _radgraph_model_type() -> str:
 
 def _radgraph_model_cache_dir() -> str | None:
     cache_dir = os.environ.get("MEDGEN_RADGRAPH_CACHE_DIR", "").strip()
-    return cache_dir or None
+    return cache_dir or str(_MODEL_ROOT / "RadGraph")
 
 
 def _radgraph_cuda_device() -> int | None:
@@ -216,7 +220,7 @@ def _radgraph_cuda_device() -> int | None:
 
 def _radgraph_tokenizer_cache_dir() -> str | None:
     cache_dir = os.environ.get("MEDGEN_RADGRAPH_TOKENIZER_CACHE_DIR", "").strip()
-    return cache_dir or None
+    return cache_dir or str(_MODEL_ROOT / "HuggingFace")
 
 
 @lru_cache(maxsize=1)
@@ -224,7 +228,7 @@ def _get_radgraph_f1_scorer():
     try:
         radgraph_module = importlib.import_module("radgraph")
     except ImportError as exc:
-        raise RuntimeError("RadGraph is required; install requirements-eval.txt") from exc
+        raise RuntimeError("RadGraph is required; install requirements.txt") from exc
 
     scorer_cls = getattr(radgraph_module, "F1RadGraph", None)
     if scorer_cls is None:

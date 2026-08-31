@@ -16,13 +16,13 @@ from typing import Any, Mapping, Optional, Sequence
 
 try:
     import json5
-except ModuleNotFoundError:  # pragma: no cover - requirements-base installs json5
+except ModuleNotFoundError:  # pragma: no cover - requirements.txt installs json5
     json5 = None
 
 from api.get_vlm_res import single_image_vlm
 
 
-DEFAULT_CONFIG_PATH = "./api/config.yaml"
+DEFAULT_CONFIG_PATH = "./config.yaml"
 DEFAULT_OUTPUT_IMAGE_PATH = "./output_image"
 
 VLM_ONLY_PROMPT = """

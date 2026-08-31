@@ -24,7 +24,7 @@ class ImageEditAPI(_OpenAICompatibleImageClient):
 
     def __init__(
         self,
-        config_path: str = "./api/config.yaml",
+        config_path: str = "./config.yaml",
         model_name: str | None = None,
         base_url: str | None = None,
         api_key: str | None = None,

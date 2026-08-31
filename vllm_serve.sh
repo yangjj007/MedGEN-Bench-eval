@@ -1,14 +1,13 @@
-#!/usr/bin/env bash
 # Start an OpenAI-compatible local Qwen VLM server with vLLM.
 #
 # Examples:
-#   VLLM_PYTHON=.venv-vllm/bin/python bash vllm_serve.sh
-#   CUDA_VISIBLE_DEVICES=1 MODEL_NAME=Qwen/Qwen3-VL-8B-Instruct bash vllm_serve.sh
+#   VLLM_PYTHON=.venv/bin/python bash vllm_serve.sh
+#   CUDA_VISIBLE_DEVICES=1 MODEL_NAME=./models/Qwen3-VL-8B-Instruct bash vllm_serve.sh
 #   PORT=8010 DAEMONIZE=1 bash vllm_serve.sh
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-model_name="${MODEL_NAME:-Qwen/Qwen3-VL-8B-Instruct}"
+model_name="${MODEL_NAME:-$root_dir/models/Qwen3-VL-8B-Instruct}"
 served_model_name="${SERVED_MODEL_NAME:-$model_name}"
 host="${HOST:-127.0.0.1}"
 port="${PORT:-8000}"
@@ -21,8 +20,12 @@ log_file="${LOG_FILE:-$root_dir/vllm_serve.log}"
 server_python="${VLLM_PYTHON:-python3}"
 startup_timeout_seconds="${STARTUP_TIMEOUT_SECONDS:-600}"
 
+export VLLM_CACHE_ROOT="${VLLM_CACHE_ROOT:-$root_dir/.cache/vllm}"
+export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-$root_dir/.cache/torchinductor}"
+export TRITON_CACHE_DIR="${TRITON_CACHE_DIR:-$root_dir/.cache/triton}"
+
 if ! "$server_python" -c 'import vllm' >/dev/null 2>&1; then
-    echo "vLLM is unavailable in $server_python. Install requirements-local-vllm.txt first." >&2
+    echo "vLLM is unavailable in $server_python. Install requirements.txt first." >&2
     exit 1
 fi
 

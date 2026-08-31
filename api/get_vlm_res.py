@@ -23,7 +23,7 @@ from openai import AsyncOpenAI, OpenAI
 from PIL import Image, ImageDraw, ImageFont
 
 
-DEFAULT_CONFIG_PATH = "./api/config.yaml"
+DEFAULT_CONFIG_PATH = "./config.yaml"
 _PLACEHOLDER_KEYS = {
     "",
     "YOUR_API_KEY",
@@ -54,7 +54,7 @@ def _read_config(config_path: str) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(
             f"VLM configuration file does not exist: {path}. "
-            "Copy api/config.example.yaml to api/config.yaml or pass config_path."
+            "Create config.yaml in the repository root or pass config_path."
         )
     try:
         config = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -125,17 +125,6 @@ def _open_rgb_image(image_input: Any) -> Image.Image:
 
 
 def _load_font(size: int) -> ImageFont.ImageFont:
-    candidates = (
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-    )
-    for candidate in candidates:
-        try:
-            return ImageFont.truetype(candidate, size)
-        except OSError:
-            continue
     return ImageFont.load_default()
 
 
@@ -233,7 +222,7 @@ class _OpenAICompatibleVLM:
                 self.config.get("api_key", ""),
                 "api_key",
                 self.config_path,
-            ) or os.environ.get("OPENAI_API_KEY")
+            ) or os.environ.get("AIHUBMIX_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.api_key = str(selected_key or "").strip()
         if self.api_key in _PLACEHOLDER_KEYS:
             if _is_local_url(self.base_url):

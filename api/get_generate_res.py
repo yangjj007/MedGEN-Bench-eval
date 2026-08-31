@@ -84,7 +84,7 @@ class _OpenAICompatibleImageClient:
 
     def __init__(
         self,
-        config_path: str = "./api/config.yaml",
+        config_path: str = "./config.yaml",
         *,
         base_url: str | None = None,
         api_key: str | None = None,
@@ -92,7 +92,12 @@ class _OpenAICompatibleImageClient:
     ) -> None:
         self.config_path = str(config_path)
         self.config = self._load_config(self.config_path)
-        configured_base_url = base_url or self.config.get("image_base_url") or self.config.get("base_url")
+        configured_base_url = (
+            base_url
+            or os.environ.get("MEDGEN_IMAGE_BASE_URL")
+            or self.config.get("image_base_url")
+            or self.config.get("base_url")
+        )
         if not isinstance(configured_base_url, str) or not configured_base_url.strip():
             raise ValueError("config must provide a non-empty base_url or image_base_url")
         self.base_url = configured_base_url.rstrip("/")
@@ -112,7 +117,7 @@ class _OpenAICompatibleImageClient:
         if not path.is_file():
             raise FileNotFoundError(
                 f"Image API config was not found: {path}. "
-                "Copy api/config.example.yaml to api/config.yaml and set credentials."
+                "Create config.yaml in the repository root and set environment credentials."
             )
         with path.open("r", encoding="utf-8") as handle:
             loaded = yaml.safe_load(handle)
@@ -123,6 +128,7 @@ class _OpenAICompatibleImageClient:
             explicit_api_key
             or os.environ.get("MEDGEN_IMAGE_API_KEY")
             or os.environ.get("MEDGEN_API_KEY")
+            or os.environ.get("AIHUBMIX_API_KEY")
             or self.config.get("image_api_key")
             or self.config.get("api_key")
         )
@@ -444,7 +450,7 @@ class ImageGenerationAPI(_OpenAICompatibleImageClient):
 
     def __init__(
         self,
-        config_path: str = "./api/config.yaml",
+        config_path: str = "./config.yaml",
         debug: bool = False,
         *,
         base_url: str | None = None,

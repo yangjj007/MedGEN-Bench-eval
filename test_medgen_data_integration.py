@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""No-network integration tests for the MedGEN Table IV eval view."""
+"""No-network integration tests for prepared MedGEN data."""
 
 from __future__ import annotations
 
@@ -16,7 +15,7 @@ import inference
 
 
 ROOT = Path(__file__).resolve().parent
-DATASET = Path(os.environ.get("MEDGEN_TABLEIV_DIR", ROOT / "MedGEN_TableIV")).resolve()
+DATASET = Path(os.environ.get("MEDGEN_DATA_DIR", ROOT / "MedGEN_data")).resolve()
 
 
 def load_jsonl(path: Path) -> list[dict]:
@@ -24,13 +23,13 @@ def load_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in handle if line.strip()]
 
 
-class TableIVIntegrationTest(unittest.TestCase):
+class MedGENDataIntegrationTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         if not DATASET.is_dir():
             raise unittest.SkipTest(
-                "Prepared Table IV data is unavailable; set MEDGEN_TABLEIV_DIR "
-                "after running prepare_medgen_tableiv.py"
+                "Prepared MedGEN data is unavailable; set MEDGEN_DATA_DIR "
+                "after running prepare_medgen_data.py"
             )
 
     def test_adapter_manifest_and_counts(self) -> None:

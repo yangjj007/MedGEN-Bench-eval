@@ -1,52 +1,40 @@
-# This repository was extracted from a larger experiment workspace. Ignore
-# everything by default, then allow only the maintained public release files.
+# Publish only the maintained release files from this workspace.
 /*
 
-# Release documentation and metadata.
 !/.gitignore
 !/README.md
 !/LICENSE
 !/NOTICE
-!/SECURITY.md
-!/CONTRIBUTING.md
+!/config.yaml
+!/requirements.txt
 
-# Reproducible runtime and evaluation entry points.
-!/requirements-base.txt
-!/requirements-eval.txt
-!/requirements-lock-py310-cu13.txt
-!/requirements-local-vllm.txt
-!/requirements-local-image.txt
 !/agent.py
 !/inference.py
 !/eval.py
-!/prepare_medgen_tableiv.py
-!/vllm_serve.sh
-!/qwen_image_edit_serve.sh
+!/prepare_medgen_data.py
 !/download_medgen_dataset.sh
 !/download_medimageinsight.sh
+!/download_local_models.sh
+!/vllm_serve.sh
+!/qwen_image_edit_serve.sh
+!/start_local_models.sh
+!/run_external_pipeline.sh
+!/run_local_pipeline.sh
 
-# Public test suite.
-!/test_tableiv_integration.py
+!/test_medgen_data_integration.py
 !/test_metrics_smoke.py
 !/test_clinical_text_metrics.py
 !/test_eval_clinical_integration.py
 !/test_clinical_image_metrics.py
 
-# Public API client helpers. Re-ignore the directory after opening its parent
-# so local configurations, fixtures, and scratch scripts cannot be added.
 !/api/
 /api/*
 !/api/__init__.py
-!/api/config.example.yaml
-!/api/config.vllm.yaml
-!/api/config.qwen-image-edit.yaml
 !/api/get_edit_res.py
 !/api/get_generate_res.py
 !/api/get_vlm_res.py
 !/api/qwen_image_edit_server.py
-!/api/smoke_api.py
 
-# Public utility modules.
 !/util/
 /util/*
 !/util/clinical_text_metrics.py
@@ -55,11 +43,45 @@
 !/util/prompt.py
 !/util/vllm_compat_entrypoint.py
 
-# Defense in depth for credentials, local environments, caches, data, and
-# generated evaluation artifacts. Dataset files are distributed externally.
+# Project-local data, model weights, environments, and generated artifacts.
+MedGEN_raw/
+MedGEN_data/
+models/
+.cache/
+.venv/
+venv/
+env/
+.conda/
+outputs/
+logs/
+eval_results/
+eval_results_type_wise/
+inference_jsonl/
+external/
+experiments/
+data/
+datasets/
+downloads/
+cache/
+caches/
+results/
+output/
+local_image_outputs/
+*.log
+*.jsonl
+*.sqlite
+*.db
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Credentials must never enter the repository.
 .env
 .env.*
-!.env.example
 *.pem
 *.key
 *.p12
@@ -69,40 +91,3 @@
 **/*credential*
 **/*secret*
 **/*token*
-api/config.yaml
-api/test.jpg
-api/test*.py
-**/__pycache__/
-*.py[cod]
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-.venv/
-venv/
-env/
-.conda/
-.download-python/
-external/
-data/
-datasets/
-downloads/
-cache/
-caches/
-outputs/
-output/
-local_image_outputs/
-results/
-logs/
-eval_results/
-eval_results_type_wise/
-eval_available/
-eval_ready/
-experiments/**/runs/
-experiments/**/logs/
-experiments/**/images/
-*.log
-*.jsonl
-*.sqlite
-*.db

@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Run resumable MedGEN-Bench inference through configurable API clients."""
 
 from __future__ import annotations
@@ -28,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--generate-model", "--generate_model", dest="generate_model")
     parser.add_argument("--edit-model", "--edit_model", dest="edit_model")
     parser.add_argument(
-        "--vlm-config", "--vlm_config", dest="vlm_config", default="./api/config.yaml",
+        "--vlm-config", "--vlm_config", dest="vlm_config", default="./config.yaml",
         help="OpenAI-compatible VLM YAML configuration.",
     )
     parser.add_argument(
@@ -120,7 +119,7 @@ def prepare_batch_data(
         if isinstance(input_ref, list):
             if len(input_ref) > 1:
                 raise ValueError(
-                    "input_image contains multiple images; run prepare_medgen_tableiv.py "
+                    "input_image contains multiple images; run prepare_medgen_data.py "
                     "to create a labeled VQA contact sheet first"
                 )
             raise ValueError("input_image must be a non-empty image path string")

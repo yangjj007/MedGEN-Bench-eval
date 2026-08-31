@@ -670,7 +670,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--require-full-task-coverage', action='store_true', help='Require all 16 paper tasks; otherwise report missing tasks')
     parser.add_argument('--local-metrics-only', action='store_true', help='Run local metrics and skip the paid VLM judge; supported only by basic_eval')
     parser.add_argument('--judge_model', type=str, default='', help='VLM judge model name; uses --judge_config when omitted')
-    parser.add_argument('--judge_config', type=str, default='./api/config.vllm.yaml', help='Local vLLM medical VLM judge configuration file')
+    parser.add_argument('--judge_config', type=str, default='./config.yaml', help='Shared API configuration file')
     parser.add_argument('--judge_backend', type=str, choices=['api'], default='api', help='OpenAI-compatible API; defaults to local vLLM')
     parser.add_argument('--enable_clinical_text_metrics', action='store_true', default=True, help='Enable clinical text metrics')
     parser.add_argument(
@@ -685,7 +685,7 @@ def build_vlm_judge_client(
     run_vlm_judge: bool,
     judge_model: str | None,
     judge_backend: str,
-    judge_config: str = "./api/config.vllm.yaml",
+    judge_config: str = "./config.yaml",
 ):
     if not run_vlm_judge:
         return None
@@ -704,7 +704,7 @@ async def basic_eval(
     run_vlm_judge: bool = True,
     judge_model: str | None = None,
     judge_backend: str = 'api',
-    judge_config: str = './api/config.vllm.yaml',
+    judge_config: str = './config.yaml',
     enable_clinical_text_metrics: bool = True,
     enable_radgraph: bool = True,
     n_boot: int = BOOTSTRAP_SAMPLES,
@@ -1307,7 +1307,7 @@ async def basic_eval_for_type_wise(
     task: str,
     data_path: str,
     jsonl_path: str,
-    judge_config: str = './api/config.vllm.yaml',
+    judge_config: str = './config.yaml',
 ) -> dict:
     """
     Run basic evaluation for a dataset subset with checkpoint/resume support for image, text, and VLM metrics.
@@ -1744,7 +1744,7 @@ async def aggregate_type_wise_results(
     task: str,
     jsonl_path: str,
     n_boot: int = BOOTSTRAP_SAMPLES,
-    judge_config: str = './api/config.vllm.yaml',
+    judge_config: str = './config.yaml',
 ) -> dict:
     """Aggregate metrics already present in an evaluated JSONL by a record key."""
     for item in data:
@@ -1839,7 +1839,7 @@ async def main():
 
     if EVAL_DEPENDENCY_ERROR is not None:
         raise RuntimeError(
-            "Full evaluation dependencies are missing; install requirements-eval.txt as described in the README"
+            "Full evaluation dependencies are missing; install requirements.txt as described in the README"
         ) from EVAL_DEPENDENCY_ERROR
 
     if args.local_metrics_only and args.mission != 'basic_eval':
