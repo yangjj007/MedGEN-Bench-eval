@@ -1,0 +1,9 @@
+MedGEN-Bench-eval
+Copyright 2026 MedGEN-Bench-eval contributors
+
+The Apache-2.0 license in LICENSE applies only to this repository's original
+source code, documentation, and other original materials. It does not grant
+rights to the MedGEN-Bench dataset, pretrained model weights, third-party
+software, or API services. Those materials remain subject to their respective
+licenses, terms, and access conditions. The dataset is distributed separately
+and is not licensed by this code license.
