@@ -14,6 +14,8 @@ port="${PORT:-8000}"
 max_model_len="${MAX_MODEL_LEN:-8192}"
 gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.85}"
 max_num_seqs="${MAX_NUM_SEQS:-4}"
+tensor_parallel_size="${TENSOR_PARALLEL_SIZE:-1}"
+limit_mm_per_prompt="${LIMIT_MM_PER_PROMPT:-}"
 quantization="${QUANTIZATION:-}"
 extra_args="${EXTRA_ARGS:-}"
 log_file="${LOG_FILE:-$root_dir/vllm_serve.log}"
@@ -28,6 +30,10 @@ if ! "$server_python" -c 'import vllm' >/dev/null 2>&1; then
     echo "vLLM is unavailable in $server_python. Install requirements.txt first." >&2
     exit 1
 fi
+if ! [[ "$tensor_parallel_size" =~ ^[1-9][0-9]*$ ]]; then
+    echo "TENSOR_PARALLEL_SIZE must be a positive integer" >&2
+    exit 1
+fi
 
 command=(
     "$server_python" "$root_dir/util/vllm_compat_entrypoint.py" serve "$model_name"
@@ -40,6 +46,12 @@ command=(
 )
 if [ -n "$max_num_seqs" ]; then
     command+=(--max-num-seqs "$max_num_seqs")
+fi
+if [ "$tensor_parallel_size" -gt 1 ]; then
+    command+=(--tensor-parallel-size "$tensor_parallel_size")
+fi
+if [ -n "$limit_mm_per_prompt" ]; then
+    command+=(--limit-mm-per-prompt "$limit_mm_per_prompt")
 fi
 if [ -n "$quantization" ]; then
     command+=(--quantization "$quantization")
@@ -57,7 +69,13 @@ health_check() {
 }
 
 if [ "${DAEMONIZE:-0}" = "1" ]; then
-    nohup "${command[@]}" >"$log_file" 2>&1 &
+    # A separate session keeps the server alive after this launcher exits.
+    # This is useful in terminals, schedulers, and non-interactive shells.
+    if command -v setsid >/dev/null 2>&1; then
+        nohup setsid "${command[@]}" >"$log_file" 2>&1 < /dev/null &
+    else
+        nohup "${command[@]}" >"$log_file" 2>&1 < /dev/null &
+    fi
     server_pid=$!
     echo "vLLM PID: $server_pid; log: $log_file"
     for _ in $(seq 1 "$startup_timeout_seconds"); do

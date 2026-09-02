@@ -4,7 +4,13 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 destination="${1:-${MEDGEN_DATASET_DIR:-$root_dir/MedGEN_raw}}"
 cache_dir="${HF_HOME:-$root_dir/.cache/huggingface}"
-python_bin="${PYTHON_BIN:-python}"
+if [ -n "${PYTHON_BIN:-}" ]; then
+    python_bin="$PYTHON_BIN"
+elif [ -x "$root_dir/.venv/bin/python" ]; then
+    python_bin="$root_dir/.venv/bin/python"
+else
+    python_bin="python3"
+fi
 revision="${MEDGEN_DATASET_REVISION:-cee5e7ae410f7c5be12d5fa55464afb094c099b7}"
 hf_bin="$("$python_bin" -c 'import sysconfig; print(sysconfig.get_path("scripts"))')/hf"
 

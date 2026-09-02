@@ -133,10 +133,28 @@ def add_text_to_image(
     text: str,
     height_ratio: float = 0.1,
     font_size: Optional[int] = None,
+    max_side: Optional[int] = None,
 ) -> Image.Image:
     """Return an RGB copy of an image with an optional label beneath it."""
 
     image = _open_rgb_image(image_input)
+    if max_side is not None:
+        try:
+            limit = int(max_side)
+        except (TypeError, ValueError) as exc:
+            image.close()
+            raise ValueError("max_side must be an integer") from exc
+        if limit < 64:
+            image.close()
+            raise ValueError("max_side must be at least 64")
+        if max(image.size) > limit:
+            scale = limit / max(image.size)
+            resized = image.resize(
+                (round(image.width * scale), round(image.height * scale)),
+                Image.Resampling.LANCZOS,
+            )
+            image.close()
+            image = resized
     label = str(text or "").strip()
     if not label:
         return image
@@ -405,6 +423,24 @@ class _OpenAICompatibleVLM:
 class double_image_vlm(_OpenAICompatibleVLM):
     """OpenAI-compatible VLM client for reference-aware image judging."""
 
+    def _judge_image_max_side(self) -> Optional[int]:
+        """Resolve an optional local judge image cap without changing cloud defaults."""
+
+        value = os.environ.get("MEDGEN_JUDGE_IMAGE_MAX_SIDE")
+        if value is None:
+            value = self.config.get("judge_image_max_side")
+        if value is None or value == "":
+            return None
+        try:
+            limit = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "MEDGEN_JUDGE_IMAGE_MAX_SIDE must be an integer when set"
+            ) from exc
+        if limit < 64:
+            raise ValueError("MEDGEN_JUDGE_IMAGE_MAX_SIDE must be at least 64")
+        return limit
+
     def _prepare_content_parts(
         self,
         prompt: str,
@@ -414,22 +450,33 @@ class double_image_vlm(_OpenAICompatibleVLM):
         output_image_lable: str,
     ) -> list[dict[str, Any]]:
         content: list[dict[str, Any]] = [{"type": "text", "text": str(prompt)}]
+        max_side = self._judge_image_max_side()
         if input_image_path:
-            labeled_input = add_text_to_image(input_image_path, input_image_lable)
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": self._image_data_uri(labeled_input)},
-                }
+            labeled_input = add_text_to_image(
+                input_image_path, input_image_lable, max_side=max_side
             )
+            try:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._image_data_uri(labeled_input)},
+                    }
+                )
+            finally:
+                labeled_input.close()
         if output_image_path:
-            labeled_output = add_text_to_image(output_image_path, output_image_lable)
-            content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": self._image_data_uri(labeled_output)},
-                }
+            labeled_output = add_text_to_image(
+                output_image_path, output_image_lable, max_side=max_side
             )
+            try:
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._image_data_uri(labeled_output)},
+                    }
+                )
+            finally:
+                labeled_output.close()
         return content
 
     async def generate_with_image_async(

@@ -47,6 +47,14 @@ def parse_args() -> argparse.Namespace:
         "--image-concurrency", "--image_concurrency", dest="image_concurrency",
         type=int, default=1, help="Maximum image requests in flight.",
     )
+    parser.add_argument(
+        "--image-size", "--image_size", dest="image_size", default=None,
+        help="Optional image API size override, for example 512x512.",
+    )
+    parser.add_argument(
+        "--image-steps", "--image_steps", dest="image_steps", type=int, default=None,
+        help="Optional image API denoising-step override.",
+    )
     parser.add_argument("--max-tokens", "--max_tokens", dest="max_tokens", type=int, default=2048)
     parser.add_argument(
         "--max-samples", "--max_samples", dest="max_samples", type=int, default=None,
@@ -242,6 +250,8 @@ async def process_batch(batch_items: Sequence[Mapping[str, Any]], args: Any) -> 
         "vlm_config_path": str(args.vlm_config),
         "output_image_path": str(args.output_image_path),
         "max_tokens": int(args.max_tokens),
+        "image_size": args.image_size,
+        "image_steps": args.image_steps,
     }
     if args.mission == "vqa":
         raw_results = await VLM(
@@ -296,6 +306,8 @@ def _validate_runtime_args(args: argparse.Namespace) -> None:
         raise ValueError("--concurrency and --image-concurrency must be positive")
     if args.max_tokens <= 0:
         raise ValueError("--max-tokens must be positive")
+    if args.image_steps is not None and args.image_steps <= 0:
+        raise ValueError("--image-steps must be positive")
     if args.max_samples is not None and args.max_samples <= 0:
         raise ValueError("--max-samples must be positive")
     if args.validate_only:

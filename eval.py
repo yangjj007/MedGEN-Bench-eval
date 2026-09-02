@@ -688,9 +688,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--validate-only', action='store_true', help='Validate inputs and image paths without loading metric models or calling an API')
     parser.add_argument('--require-full-task-coverage', action='store_true', help='Require all 16 paper tasks; otherwise report missing tasks')
     parser.add_argument('--local-metrics-only', action='store_true', help='Run local metrics and skip the paid VLM judge; supported only by basic_eval')
-    parser.add_argument('--judge_model', type=str, default='', help='VLM judge model name; uses --judge_config when omitted')
-    parser.add_argument('--judge_config', type=str, default='./config.yaml', help='Shared API configuration file')
-    parser.add_argument('--judge_backend', type=str, choices=['api'], default='api', help='OpenAI-compatible API; defaults to local vLLM')
+    parser.add_argument('--judge_model', '--judge-model', dest='judge_model', type=str, default='', help='VLM judge model name; uses --judge-config when omitted')
+    parser.add_argument('--judge_config', '--judge-config', dest='judge_config', type=str, default='./config.yaml', help='Shared API configuration file')
+    parser.add_argument('--judge_base_url', '--judge-base-url', dest='judge_base_url', type=str, default='', help='Optional judge endpoint. This takes precedence over MEDGEN_VLM_BASE_URL.')
+    parser.add_argument('--judge_api_key', '--judge-api-key', dest='judge_api_key', type=str, default='', help='Optional judge API key. Use EMPTY for a local vLLM endpoint.')
+    parser.add_argument('--judge_backend', type=str, choices=['api'], default='api', help='OpenAI-compatible judge endpoint')
     parser.add_argument('--enable_clinical_text_metrics', action='store_true', default=True, help='Enable clinical text metrics')
     parser.add_argument(
         '--disable_radgraph',
@@ -705,12 +707,22 @@ def build_vlm_judge_client(
     judge_model: str | None,
     judge_backend: str,
     judge_config: str = "./config.yaml",
+    judge_base_url: str | None = None,
+    judge_api_key: str | None = None,
 ):
     if not run_vlm_judge:
         return None
     # Priority: --judge_model > config model_name > default medical VLM
     selected_model = judge_model or ""
-    return double_image_vlm(config_path=judge_config, model_name=selected_model)
+    client_kwargs = {
+        'config_path': judge_config,
+        'model_name': selected_model,
+    }
+    if judge_base_url:
+        client_kwargs['base_url'] = judge_base_url
+    if judge_api_key:
+        client_kwargs['api_key'] = judge_api_key
+    return double_image_vlm(**client_kwargs)
 
 
 
@@ -724,6 +736,8 @@ async def basic_eval(
     judge_model: str | None = None,
     judge_backend: str = 'api',
     judge_config: str = './config.yaml',
+    judge_base_url: str | None = None,
+    judge_api_key: str | None = None,
     enable_clinical_text_metrics: bool = True,
     enable_radgraph: bool = True,
     n_boot: int = BOOTSTRAP_SAMPLES,
@@ -733,7 +747,14 @@ async def basic_eval(
     """
     for item in data:
         validate_paper_task(paper_task_for_item(item))
-    vlm_client = build_vlm_judge_client(run_vlm_judge, judge_model, judge_backend, judge_config)
+    vlm_client = build_vlm_judge_client(
+        run_vlm_judge,
+        judge_model,
+        judge_backend,
+        judge_config,
+        judge_base_url,
+        judge_api_key,
+    )
     # The reference-aware and reference-free views are submitted together.
     # A per-view concurrency of one therefore keeps at most two image-bearing
     # requests in flight on the shared GPU during the conservative default run.
@@ -1645,7 +1666,7 @@ async def eval_type_wise(data: list, batch_size: int, type_key: str, task: str, 
         grouped_data[modality_type].append(item)
     
     # ============================================================
-    # 🔥 Write a modality-split VLM JSONL file before the final loop
+    # Write a modality-split VLM JSONL file before the final loop.
     # ============================================================
     import json
 
@@ -1883,6 +1904,8 @@ async def main():
             judge_model=args.judge_model,
             judge_backend=args.judge_backend,
             judge_config=args.judge_config,
+            judge_base_url=args.judge_base_url or None,
+            judge_api_key=args.judge_api_key or None,
             enable_clinical_text_metrics=args.enable_clinical_text_metrics,
             enable_radgraph=not args.disable_radgraph,
             n_boot=args.bootstrap_samples,

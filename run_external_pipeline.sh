@@ -7,7 +7,7 @@ cd "$root_dir"
 python_bin="${PYTHON_BIN:-$root_dir/.venv/bin/python}"
 config_path="$root_dir/config.yaml"
 data_dir="${MEDGEN_DATA_DIR:-$root_dir/MedGEN_data}"
-output_dir="$root_dir/outputs/external"
+output_dir="${EXTERNAL_OUTPUT_DIR:-$root_dir/outputs/external}"
 vlm_model="${EXTERNAL_VLM_MODEL:-qwen3-vl-235b-a22b-instruct}"
 edit_model="${EXTERNAL_EDIT_MODEL:-gpt-image-1-mini}"
 generate_model="${EXTERNAL_GENERATE_MODEL:-gpt-image-1-mini}"
@@ -31,6 +31,7 @@ slug() {
 }
 
 mkdir -p "$output_dir/inference" "$output_dir/images"
+export MEDGEN_EVAL_RESULTS_DIR="$output_dir/eval"
 
 "$python_bin" inference.py --jsonl-path "$data_dir/vqa.jsonl" \
     --mission vqa --vlm-model "$vlm_model" --vlm-config "$config_path" \

@@ -302,6 +302,8 @@ async def VLM2Generate(
     vlm_concurrency: int = 5,
     image_concurrency: int = 3,
     max_tokens: int = 2048,
+    image_size: Optional[str] = None,
+    image_steps: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """Generate text and target images using separate VLM and image configs."""
 
@@ -336,6 +338,11 @@ async def VLM2Generate(
 
     destination = Path(output_image_path)
     destination.mkdir(parents=True, exist_ok=True)
+    image_request_options: dict[str, Any] = {}
+    if image_size:
+        image_request_options["size"] = str(image_size)
+    if image_steps is not None:
+        image_request_options["num_inference_steps"] = int(image_steps)
     requests: list[dict[str, Any]] = []
     for index, record in pending:
         requests.append(
@@ -346,6 +353,7 @@ async def VLM2Generate(
                 "output_dir": str(destination),
                 "file_prefix": f"generated_{index:06d}_{uuid.uuid4().hex[:8]}",
                 "num_images": 1,
+                **image_request_options,
             }
         )
 
@@ -386,6 +394,8 @@ async def VLM2Edit(
     vlm_concurrency: int = 5,
     image_concurrency: int = 3,
     max_tokens: int = 2048,
+    image_size: Optional[str] = None,
+    image_steps: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """Generate text and edited images using separate VLM and image configs."""
 
@@ -423,6 +433,11 @@ async def VLM2Edit(
     image_prompts = [
         (normalized_images[index], record["edit_prompt"]) for index, record in pending
     ]
+    image_request_options: dict[str, Any] = {}
+    if image_size:
+        image_request_options["size"] = str(image_size)
+    if image_steps is not None:
+        image_request_options["num_inference_steps"] = int(image_steps)
 
     from api.get_edit_res import ImageEditAPI
 
@@ -436,6 +451,7 @@ async def VLM2Edit(
             image_prompts,
             save_dir=str(destination),
             max_concurrent=max(1, int(image_concurrency)),
+            **image_request_options,
         )
     else:
         image_results = await asyncio.to_thread(
@@ -443,6 +459,7 @@ async def VLM2Edit(
             image_prompts,
             save_dir=str(destination),
             max_concurrent=max(1, int(image_concurrency)),
+            **image_request_options,
         )
 
     for (index, record), image_result in zip(pending, image_results):

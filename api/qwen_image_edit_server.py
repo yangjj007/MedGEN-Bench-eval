@@ -213,8 +213,8 @@ def build_app(settings: ServerSettings) -> FastAPI:
             raise HTTPException(status_code=422, detail="response_format must be url or b64_json")
         steps = num_inference_steps or settings.default_steps
         cfg_scale = true_cfg_scale or settings.default_cfg_scale
-        if not (1 <= steps <= 100):
-            raise HTTPException(status_code=422, detail="num_inference_steps must be 1..100")
+        if not (2 <= steps <= 100):
+            raise HTTPException(status_code=422, detail="num_inference_steps must be 2..100")
         if not (0.0 < cfg_scale <= 20.0):
             raise HTTPException(status_code=422, detail="true_cfg_scale must be in (0, 20]")
 
@@ -272,8 +272,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    if args.default_steps < 1:
-        raise ValueError("--default-steps must be positive")
+    if args.default_steps < 2:
+        raise ValueError("--default-steps must be at least 2")
     if args.default_cfg_scale <= 0:
         raise ValueError("--default-cfg-scale must be positive")
     settings = ServerSettings(

@@ -40,6 +40,9 @@
 !/util/prompt.py
 !/util/vllm_compat_entrypoint.py
 
+!/tests/
+!/tests/**
+
 # Project-local data, model weights, environments, and generated artifacts.
 MedGEN_raw/
 MedGEN_data/
